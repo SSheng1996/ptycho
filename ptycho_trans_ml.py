@@ -1405,7 +1405,8 @@ class ptycho_trans(object):
                     chi_tmp = chi_tmp + np.sum((np.sqrt(tmp) - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
         elif self.multislice_flag:
             for i, (x_start, x_end, y_start, y_end) in enumerate(self.point_info):
-                tmp = np.abs(fftn(self.prb_ms[i][self.slice_num-1p.sqrt(1.*self.nx_prb*self.ny_]*self.obj_ms[x_start:x_end, y_start:y_end,self.slice_num-1])/np.sqrt(1.*self.nx_prb*self.ny_prb))
+                tmp = np.abs(fftn(self.prb_ms[i][self.slice_num-1]*self.obj_ms[x_start:x_end, y_start:y_end,self.slice_num-1])/\
+                    np.sqrt(1.*self.nx_prb*self.ny_prb))
                 if np.sum((self.diff_array[i])**2) > 0.:
                     chi_tmp = chi_tmp + np.sum((tmp - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
         else:
