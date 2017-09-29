@@ -26,7 +26,7 @@ def congrid_fft(array_in, shape):
     array_out =  np.fft.fftshift(np.fft.ifftn(np.fft.fftshift(array_in_fft_n)))*np.sqrt(1.*shape[0]*shape[1])
     return array_out
 
-def recon(scan_num,sign,n_iterations,p_flag):
+def recon(scan_num,sign,n_iterations,p_flag, processes):
 
     mode_flag = 0
     mesh_flag = 1
@@ -169,7 +169,7 @@ def recon(scan_num,sign,n_iterations,p_flag):
     recon.position_correction_start = 50
     recon.position_correction_step = 10
 
-    recon.processes = 0
+    recon.processes = processes
     recon.recon_ptycho()
     recon.save_recon()
     recon.display_recon()
@@ -178,4 +178,5 @@ if __name__ == '__main__':
     scan_num,sign = sys.argv[1:3]
     n_iterations =  np.int(sys.argv[3])
     p_flag = np.int(sys.argv[4])
-    recon(scan_num,sign,n_iterations,p_flag)
+    processes = np.int(sys.argv[5])
+    recon(scan_num,sign,n_iterations,p_flag,processes)

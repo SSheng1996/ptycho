@@ -25,6 +25,15 @@ from cal_stxm_dpc import cal_stxm_dpc
 #from rm_phase_ramp_recon_all import rm_phase_ramp
 
 
+## For GPU 
+import pycuda.autoinit
+import pycuda.driver as cuda
+from  pycuda.compiler import SourceModule
+from pycuda import gpuarray, compiler, tools 
+import skcuda.fft as cu_fft
+
+
+
 if 'PROFILE' not in os.environ:
     def profile(fcn):
         return fcn
@@ -197,6 +206,21 @@ class ptycho_trans(object):
         self.obj_ms_old = None
         self.error_prb_ms = None
         self.error_obj_ms = None
+
+        #GPU
+        self.gpu_flag = False
+	self.prb_d = None
+        self.points_info_d = None
+        self.obj_d = None
+        self.product_d = None
+        self.points_info_d = None
+        self.prb_obj_d = None 
+        self.diff_d = None
+	self.plan = None
+        self.gpu_b_size = 32
+         
+        #for timing
+        self.elaps=[0.0]*8
 
         if self.sf_flag:
             self.use_scipy_fft()
@@ -650,6 +674,23 @@ class ptycho_trans(object):
 
         for product, result in zip(self.product, results):
             product += result
+
+    def recon_dm_trans_gpu(self):
+        self.prb_d = gpuarray.to_gpu(self.prb)
+        self.obj_d = gpuarray.to_gpu(self.obj)
+        self.prb_obj_d = gpuarray.empty((self.num_points,self.nx_prb,self.ny_prb), dtype=np.complex128 ) 
+        
+        stream = []
+        for i in range(self.num_points) :
+            stream.append(cuda.Stream)
+            self.diff_d[i,:] = gpuarray.to_gpu_async(self.diff_array, stream=stream[i])
+            x_start, x_end, y_start,y_end = self.point_info[i] 
+            prb_m_obj(i, x_start, x_end , y_start,y_end, \
+                self.nx_obj,self.ny_obj,self.nx_prb,self.ny_prb, 
+                block=(self.block_size,1,1), stream=stream[i], grid=(self.grid_size,1,1) )
+            
+            
+                    
 
     # difference map for multislice case, only updates exitwaves on the last plane
     def recon_dm_trans_ms(self):
@@ -1364,7 +1405,7 @@ class ptycho_trans(object):
                     chi_tmp = chi_tmp + np.sum((np.sqrt(tmp) - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
         elif self.multislice_flag:
             for i, (x_start, x_end, y_start, y_end) in enumerate(self.point_info):
-                tmp = np.abs(fftn(self.prb_ms[i][self.slice_num-1]*self.obj_ms[x_start:x_end, y_start:y_end,self.slice_num-1])/np.sqrt(1.*self.nx_prb*self.ny_prb))
+                tmp = np.abs(fftn(self.prb_ms[i][self.slice_num-1p.sqrt(1.*self.nx_prb*self.ny_]*self.obj_ms[x_start:x_end, y_start:y_end,self.slice_num-1])/np.sqrt(1.*self.nx_prb*self.ny_prb))
                 if np.sum((self.diff_array[i])**2) > 0.:
                     chi_tmp = chi_tmp + np.sum((tmp - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
         else:
@@ -1374,6 +1415,33 @@ class ptycho_trans(object):
                     chi_tmp = chi_tmp + np.sum((tmp - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
 
         self.error_chi[it] = np.sqrt(chi_tmp/self.num_points)
+
+    def cal_chi_error_gpu(self, it):
+            chi2=0.0
+            cuda.memcpy_htod(self.prb_d, self.prb )
+            cuda.memcpy_htod(self.obj_d, self.obj )
+
+            block_size = 128
+            n_blocks = self.nx_prb*self.ny_prb/block_size
+            
+            streams = []
+        for i in range(self.num_points)
+            streams.append(cuda.Stream())
+        for i in range(self.num_points)
+            self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d[i], args, \
+                block=(block_size,1,1), grid=(n_blocks,1,1), stream=streams[i] )
+    
+        for i in range(self.num_points in range(self.num_points))
+            plan=skcuda.fft.Plan(shape(self.prb),np.complex128,np.complex128,
+                stream=streams[i]  )
+            cu_fft.fft(iself.fft_tmp_d[i], self.fft_tmp_d[i], plan )
+        for i in range(self.num_points)
+            chi_tmp[i]=fft_tmp_d[i].get_async(stream=streams[i])/np.sqrt(1.*self.nx_prb*self.ny_prb)  
+            
+        for i in range(self.num_points)
+            chi += np.sum((chi_tmp[i] - self.diff_array[i])**2)/self.diff_sum_sq[i]
+             
+        self.error_chi[it] = np.sqrt(chi/self.num_points)
 
     def cal_coh_error(self, it):
         self.error_coh[it] = np.sqrt(np.sum(np.abs(self.coh - self.coh_old)**2)) / \
@@ -1755,6 +1823,8 @@ class ptycho_trans(object):
                         self.product.append(np.zeros((self.nx_prb,self.ny_prb)).astype(complex))
             '''
 
+            t0=time.time()
+
             if self.mode_flag:
                 self.prb_mode_old = self.prb_mode.copy()
                 self.obj_mode_old = self.obj_mode.copy()
@@ -1775,6 +1845,9 @@ class ptycho_trans(object):
 
             if self.multislice_flag:
                 self.multislice_propagate_forward()
+
+            t1 = time.time() 
+            self.elaps[0] +=t1-t0
 
             if self.pc_flag:
                 if self.pc_modulus_flag:
@@ -1816,6 +1889,9 @@ class ptycho_trans(object):
                     elif self.alg_flag == 'ER':
                         self.recon_er_trans()
                         print('ER')
+
+            t0 = time.time() 
+            self.elaps[1] += t0-t1
 
             if self.mode_flag:
                 if(it >= self.start_update_probe):
@@ -1863,9 +1939,21 @@ class ptycho_trans(object):
                     if(position_count == 0):
                         self.position_correction_flag = False
 
+            t1 = time.time() 
+            self.elaps[2]+=t1-t0
+
+
             self.cal_obj_error(it)
             self.cal_prb_error(it)
+
+            t0 = time.time() 
+            self.elaps[3]+=t0-t1
+
             self.cal_chi_error(it)
+
+            t1 = time.time() 
+            self.elaps[4]+=t1-t0
+
             if(self.update_coh_flag):
                 self.cal_coh_error(it)
 
@@ -1935,6 +2023,10 @@ class ptycho_trans(object):
                 if (it >= self.start_update_product):
                     if np.mod(it, 5) == 0:
                         self.init_product()
+
+            t0 = time.time() 
+            self.elaps[5]+=t0-t1
+
 
             if self.online_flag:
                 if it >= 0 and (it % 2) == 0:
@@ -2038,6 +2130,10 @@ class ptycho_trans(object):
                         #plt.show()
 
 
+            t1 = time.time() 
+            self.elaps[6] += t1-t0
+
+
         self.time_end = time.time()
         print('++++++++++++++++++++++++++++++++++++++++++++++++++')
         print('object size:', self.nx_obj, 'x', self.ny_obj)
@@ -2045,6 +2141,8 @@ class ptycho_trans(object):
         print('total scan points:', self.num_points)
         print(self.n_iterations, 'iterations take', self.time_end - self.time_start, 'sec')
         print('++++++++++++++++++++++++++++++++++++++++++++++++++')
+
+        print('time elaps : ', self.elaps) 
 
         if self.mode_flag:
             self.obj_mode_ave = self.obj_mode_ave / self.ave_i
