@@ -1418,28 +1418,28 @@ class ptycho_trans(object):
         self.error_chi[it] = np.sqrt(chi_tmp/self.num_points)
 
     def cal_chi_error_gpu(self, it):
-            chi2=0.0
-            cuda.memcpy_htod(self.prb_d, self.prb )
-            cuda.memcpy_htod(self.obj_d, self.obj )
+        chi2=0.0
+        cuda.memcpy_htod(self.prb_d, self.prb )
+        cuda.memcpy_htod(self.obj_d, self.obj )
 
-            block_size = 128
-            n_blocks = self.nx_prb*self.ny_prb/block_size
+        block_size = 128
+        n_blocks = self.nx_prb*self.ny_prb/block_size
             
-            streams = []
-        for i in range(self.num_points)
+        streams = []
+        for i in range(self.num_points):
             streams.append(cuda.Stream())
-        for i in range(self.num_points)
+        for i in range(self.num_points):
             self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d[i], args, \
                 block=(block_size,1,1), grid=(n_blocks,1,1), stream=streams[i] )
     
-        for i in range(self.num_points in range(self.num_points))
+        for i in range(self.num_points) :
             plan=skcuda.fft.Plan(shape(self.prb),np.complex128,np.complex128,
                 stream=streams[i]  )
             cu_fft.fft(iself.fft_tmp_d[i], self.fft_tmp_d[i], plan )
-        for i in range(self.num_points)
+        for i in range(self.num_points):
             chi_tmp[i]=fft_tmp_d[i].get_async(stream=streams[i])/np.sqrt(1.*self.nx_prb*self.ny_prb)  
             
-        for i in range(self.num_points)
+        for i in range(self.num_points):
             chi += np.sum((chi_tmp[i] - self.diff_array[i])**2)/self.diff_sum_sq[i]
              
         self.error_chi[it] = np.sqrt(chi/self.num_points)
