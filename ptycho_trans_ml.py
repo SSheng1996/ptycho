@@ -213,11 +213,17 @@ class ptycho_trans(object):
         self.points_info_d = None
         self.obj_d = None
         self.product_d = None
+        self.fft_tmp_d = None
         self.points_info_d = None
         self.prb_obj_d = None 
         self.diff_d = None
 	self.plan = None
-        self.gpu_b_size = 32
+        self.diff_sum_sq = None
+        self.diff_sum_sq_d = None
+        self.kernel_chi_prb_obj = None 
+        self.plan_f = None
+        self.plan_r = None
+        
          
         #for timing
         self.elaps=[0.0]*8
@@ -227,6 +233,49 @@ class ptycho_trans(object):
             #self.use_pyfftw_fft()
         else:
             self.use_numpy_fft()
+
+    def gpu_init(self):
+        self.diff_sum_sq = np.sum(self.diff_array**2, axis=(1,2))
+        self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
+#        self.prb_d = gpuarray.empty(np.shape(self.prb),dtype=np.complex128) 
+        self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
+#        self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
+        self.prb_obj_d = gpuarray.empty(np.shape(self.product),dtype=np.complex128)       
+        self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
+        self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
+        self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.num_points)
+
+
+        func_mod = SourceModule("""
+        #include <cuComplex.h>
+        #include <stdio.h>
+        extern "C" {
+        __global__ void cal_prb_obj_2(cuDoubleComplex *prb, cuDoubleComplex *obj, cuDoubleComplex *prb_obj, int * point_info, int  nx, int ny ,int o_ny, int points  )
+        {
+
+        int i = blockIdx.x/nx ;
+        int x = blockIdx.x % nx ;
+        int xstart = point_info[i*4];
+        int ystart = point_info[i*4+2];
+
+	
+
+        int tid = threadIdx.x ;
+
+        int idx_p = tid + x* ny ;
+        int idx_o = tid + (x  + xstart )*o_ny + ystart ;
+        int idx_po = idx_p + i * nx * ny ;
+
+        cuDoubleComplex result = cuCmul(prb[idx_p],obj[idx_o]) ;
+        prb_obj[idx_po] = result ;
+
+
+        }
+        }
+
+        """, no_extern_c=1)
+
+        self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj_2") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1418,31 +1467,41 @@ class ptycho_trans(object):
         self.error_chi[it] = np.sqrt(chi_tmp/self.num_points)
 
     def cal_chi_error_gpu(self, it):
-        chi2=0.0
-        cuda.memcpy_htod(self.prb_d, self.prb )
-        cuda.memcpy_htod(self.obj_d, self.obj )
+        chi = 0.0
+        scale=np.sqrt(1.*self.nx_prb*self.ny_prb)
+        chi_tmp = np.empty_like(self.product)
 
-        block_size = 128
-        n_blocks = self.nx_prb*self.ny_prb/block_size
-            
-        streams = []
+        myprb,myobj = self.prb, self.obj 
+        cuda.memcpy_htod(self.prb_d, myprb )
+        cuda.memcpy_htod(self.obj_d, myobj )
+
+
+        block_size = self.ny_prb
+        n_blocks = self.num_points*self.nx_prb*self.ny_prb/block_size
+	
+	nx = np.int32(self.nx_prb)
+	ny = np.int32(self.ny_prb)
+	o_ny = np.int32(self.ny_obj)
+	points = np.int32(self.num_points)
+
+
+        self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d, self.point_info_d, \
+		nx, ny, o_ny, points, \
+                block=(block_size,1,1), grid=(n_blocks,1,1) )
+        cuda.memcpy_dtoh(chi_tmp, self.fft_tmp_d.gpudata )
+
+
+        cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
+        chi_tmp =self.fft_tmp_d.get()
+
+
         for i in range(self.num_points):
-            streams.append(cuda.Stream())
-        for i in range(self.num_points):
-            self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d[i], args, \
-                block=(block_size,1,1), grid=(n_blocks,1,1), stream=streams[i] )
-    
-        for i in range(self.num_points) :
-            plan=skcuda.fft.Plan(shape(self.prb),np.complex128,np.complex128,
-                stream=streams[i]  )
-            cu_fft.fft(iself.fft_tmp_d[i], self.fft_tmp_d[i], plan )
-        for i in range(self.num_points):
-            chi_tmp[i]=fft_tmp_d[i].get_async(stream=streams[i])/np.sqrt(1.*self.nx_prb*self.ny_prb)  
-            
-        for i in range(self.num_points):
-            chi += np.sum((chi_tmp[i] - self.diff_array[i])**2)/self.diff_sum_sq[i]
+            tmp = np.sum((np.abs(chi_tmp[i])/scale - self.diff_array[i])**2)
+            chi += tmp/self.diff_sum_sq[i]
              
         self.error_chi[it] = np.sqrt(chi/self.num_points)
+	print("error Chi: " , self.error_chi[it] )
+
 
     def cal_coh_error(self, it):
         self.error_coh[it] = np.sqrt(np.sum(np.abs(self.coh - self.coh_old)**2)) / \
@@ -1804,6 +1863,10 @@ class ptycho_trans(object):
                 file_num = self.check_file_num()
                 time.sleep(5)
         '''
+
+        if self.gpu_flag:
+            self.gpu_init()
+
         self.time_start = time.time()
 
         for it in range(self.n_iterations):
@@ -1949,8 +2012,10 @@ class ptycho_trans(object):
 
             t0 = time.time() 
             self.elaps[3]+=t0-t1
-
-            self.cal_chi_error(it)
+            if(self.gpu_flag) :
+                self.cal_chi_error_gpu(it)
+            else :
+                self.cal_chi_error(it)
 
             t1 = time.time() 
             self.elaps[4]+=t1-t0
