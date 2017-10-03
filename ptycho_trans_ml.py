@@ -237,6 +237,8 @@ class ptycho_trans(object):
     def gpu_init(self):
         self.diff_sum_sq = np.sum(self.diff_array**2, axis=(1,2))
         self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
+        self.diff_d = gpuarray.to_gpu(self.diff_array)
+        print "type of diffarray:", type(self.diff_array[0,0])
 #        self.prb_d = gpuarray.empty(np.shape(self.prb),dtype=np.complex128) 
         self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
 #        self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
@@ -1494,13 +1496,18 @@ class ptycho_trans(object):
         cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
         chi_tmp =self.fft_tmp_d.get()
 
+#        chi_d = gpuarray.zero((
+#        self.kernel_chi_chi(self.fft_tmp_d, self.diff_array, scale_d, self.diff_sum_d, chi_d )
+#        chi=gpuarray.get(chi_d)[0]                          
+        t0 = time.time()
 
         for i in range(self.num_points):
             tmp = np.sum((np.abs(chi_tmp[i])/scale - self.diff_array[i])**2)
             chi += tmp/self.diff_sum_sq[i]
+        
+        self.elaps[7] += time.time()-t0 
              
         self.error_chi[it] = np.sqrt(chi/self.num_points)
-	print("error Chi: " , self.error_chi[it] )
 
 
     def cal_coh_error(self, it):
