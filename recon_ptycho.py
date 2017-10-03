@@ -54,7 +54,7 @@ def recon(scan_num,sign,n_iterations,p_flag, processes):
 
     recon.start_ave = 0.8
     recon.scan_num = scan_num  #scan number
-    recon.online_flag = True
+    recon.online_flag = False
     #recon.tif_threshold = threshold
     recon.sign = sign      #saving file name
     recon.x_range_um = x_range        #scan range in x direction (um)
