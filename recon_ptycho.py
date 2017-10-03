@@ -170,6 +170,7 @@ def recon(scan_num,sign,n_iterations,p_flag, processes):
     recon.position_correction_step = 10
 
     recon.processes = processes
+    recon.gpu_flag = 1
     recon.recon_ptycho()
     recon.save_recon()
     recon.display_recon()
