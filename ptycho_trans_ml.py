@@ -226,7 +226,7 @@ class ptycho_trans(object):
         
          
         #for timing
-        self.elaps=[0.0]*8
+        self.elaps=[0.0]*13
 
         if self.sf_flag:
             self.use_scipy_fft()
@@ -1468,7 +1468,9 @@ class ptycho_trans(object):
 
         self.error_chi[it] = np.sqrt(chi_tmp/self.num_points)
 
+
     def cal_chi_error_gpu(self, it):
+	t1 = time.time()
         chi = 0.0
         scale=np.sqrt(1.*self.nx_prb*self.ny_prb)
         chi_tmp = np.empty_like(self.product)
@@ -1485,21 +1487,32 @@ class ptycho_trans(object):
 	ny = np.int32(self.ny_prb)
 	o_ny = np.int32(self.ny_obj)
 	points = np.int32(self.num_points)
-
+	cuda.Context.synchronize()
+        t2=time.time()
+        self.elaps[9] += t2-t1
 
         self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d, self.point_info_d, \
 		nx, ny, o_ny, points, \
                 block=(block_size,1,1), grid=(n_blocks,1,1) )
-        cuda.memcpy_dtoh(chi_tmp, self.fft_tmp_d.gpudata )
+#        cuda.memcpy_dtoh(chi_tmp, self.fft_tmp_d.gpudata )
+	cuda.Context.synchronize()
+        t3=time.time()
+        self.elaps[10] += t3-t2
 
 
         cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
+	cuda.Context.synchronize()
+        t1=time.time()
+        self.elaps[11] += t1-t3
         chi_tmp =self.fft_tmp_d.get()
 
+	cuda.Context.synchronize()
 #        chi_d = gpuarray.zero((
 #        self.kernel_chi_chi(self.fft_tmp_d, self.diff_array, scale_d, self.diff_sum_d, chi_d )
 #        chi=gpuarray.get(chi_d)[0]                          
         t0 = time.time()
+	self.elaps[12] += t0-t1
+
 
         for i in range(self.num_points):
             tmp = np.sum((np.abs(chi_tmp[i])/scale - self.diff_array[i])**2)
@@ -2204,7 +2217,7 @@ class ptycho_trans(object):
 
 
             t1 = time.time() 
-            self.elaps[6] += t1-t0
+            self.elaps[8] += t1-t0
 
 
         self.time_end = time.time()

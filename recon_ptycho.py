@@ -172,8 +172,8 @@ def recon(scan_num,sign,n_iterations,p_flag, processes):
     recon.processes = processes
     recon.gpu_flag = 1
     recon.recon_ptycho()
-    recon.save_recon()
-    recon.display_recon()
+#    recon.save_recon()
+#    recon.display_recon()
 
 if __name__ == '__main__':
     scan_num,sign = sys.argv[1:3]
