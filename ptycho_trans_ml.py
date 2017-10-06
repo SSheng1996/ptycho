@@ -1614,28 +1614,10 @@ class ptycho_trans(object):
 	cuda.Context.synchronize()
 
         chi_tmp = buff.get() 
-#        print "chi_tmp[0:16]", chi_tmp[0:16], np.sum(chi_tmp[0:16])
         
-#        tmp1 = abs(chi_tmp_cpu[0,0,:])/scale_sqrt 
-#       print  tmp1[0], self.diff_array[0,0,0], (tmp1[0]- self.diff_array[0,0,0]) **2/self.diff_sum_sq[0]   
-#        print (tmp1- self.diff_array[0,0,:]) **2/self.diff_sum_sq[0] 
-#        print "sum =" , np.sum((tmp1- self.diff_array[0,0,:]) **2/self.diff_sum_sq[0])
-        
-#        for i in range(16):
-#            tmp =np.sum(np.abs(chi_tmp_cpu[0,i*8:(i+1)*8,:])/scale_sqrt-self.diff_array[0,i*8:(i+1)*8,:])**2/self.diff_sum_sq[0]
-#            print "cpu chi[%s] %% i " , tmp, self.diff_sum_sq[0]
-        
-        '''
-        for i in range(self.num_points):
-
-            tmp = np.sum((abs(chi_tmp_cpu[i])/scale_sqrt -self.diff_array[i])**2)/self.diff_sum_sq[i] 
-            print "16 blockss, i=%s ,gpu, cpu %% i", np.sum(chi_tmp[i*16:(i+1)*16]), tmp
-        '''
         ### number of GOU blocks for futher reduce to nblock_reduce numbers
         nblock_reduce=(nblocks-1)/block_size +1 
 
-        print "nblcok_reduce =" , nblocks,nblock_reduce,block_size
-        
                 
         '''
         buff = cuda.mem_alloc(nblock_reduce*8  )        
