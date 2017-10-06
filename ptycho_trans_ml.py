@@ -221,6 +221,8 @@ class ptycho_trans(object):
         self.diff_sum_sq = None
         self.diff_sum_sq_d = None
         self.kernel_chi_prb_obj = None 
+        self.kernel_chi_sum_block = None 
+        self.kernel_chi_reduce = None 
         self.plan_f = None
         self.plan_r = None
         
@@ -238,7 +240,7 @@ class ptycho_trans(object):
         self.diff_sum_sq = np.sum(self.diff_array**2, axis=(1,2))
         self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
         self.diff_d = gpuarray.to_gpu(self.diff_array)
-        print "type of diffarray:", type(self.diff_array[0,0])
+        self.diff_sum_sq_d = gpuarray.to_gpu(self.diff_sum_sq)
 #        self.prb_d = gpuarray.empty(np.shape(self.prb),dtype=np.complex128) 
         self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
 #        self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
@@ -250,10 +252,12 @@ class ptycho_trans(object):
 
         func_mod = SourceModule("""
         #include <cuComplex.h>
+        #include <math.h>
         #include <stdio.h>
         extern "C" {
-        __global__ void cal_prb_obj_2(cuDoubleComplex *prb, cuDoubleComplex *obj, cuDoubleComplex *prb_obj, int * point_info, int  nx, int ny ,int o_ny, int points  )
+        __global__ void cal_prb_obj(cuDoubleComplex *prb, cuDoubleComplex *obj, cuDoubleComplex *prb_obj, int * point_info, int  nx, int ny ,int o_ny, int points  )
         {
+
 
         int i = blockIdx.x/nx ;
         int x = blockIdx.x % nx ;
@@ -275,9 +279,96 @@ class ptycho_trans(object):
         }
         }
 
+
+
+        extern "C" {
+        __global__ void chi_sum_block( cuDoubleComplex * prb_obj, double * diff, double* diff_sum_sq , double* buff, int scale  )
+        {
+        extern  __shared__ double sdata[];
+
+        
+        unsigned int tid =threadIdx.x ;
+        unsigned int idx = tid + blockDim.x * blockIdx.x ;
+        unsigned int point = idx/scale ;
+        double norm = diff_sum_sq[point] ;
+        sdata[tid]=0.0 ;
+        
+        
+        
+        double chi = cuCabs(prb_obj[idx])/sqrt(double(scale))-diff[idx] ;
+        chi *= chi ;
+        if (norm > 0.0) sdata[tid] = chi/norm ;
+        __syncthreads() ;
+
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        {
+            if (tid < s) {
+            sdata[tid] += sdata[tid + s];}
+            __syncthreads();
+        }
+        if (tid < 32)
+        {
+        sdata[tid] += sdata[tid + 32];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 16];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 8];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 4];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 2];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 1];
+        }
+
+        if(tid ==0 ) buff[blockIdx.x]=sdata[0] ; 
+        //if(tid ==0 && blockIdx.x < 16) printf("buff[%d]=%f , %d \\n",blockIdx.x,sdata[0], point ) ;
+
+        
+        }
+        }
+
+        extern "C" {
+        __global__ void chi_reduce( double* buff, double * buff1, int N )
+        {
+        extern __shared__ double sdata[];
+
+
+        
+        unsigned int tid = blockIdx.x ;
+        sdata[0] = 0.0 ;
+        unsigned int i = tid + blockDim.x * blockIdx.x  ;
+        if ( i < N ) 
+        sdata[tid] = buff[i];
+
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        {
+            if (tid < s)
+            sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        if (tid < 32)
+        {
+        sdata[tid] += sdata[tid + 32];
+        sdata[tid] += sdata[tid + 16];
+        sdata[tid] += sdata[tid + 8];
+        sdata[tid] += sdata[tid + 4];
+        sdata[tid] += sdata[tid + 2];
+        sdata[tid] += sdata[tid + 1];
+        }
+
+        if (tid ==0 ) buff1[blockIdx.x]=sdata[0] ;
+
+
+        }
+
+        }
+
         """, no_extern_c=1)
 
-        self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj_2") 
+        self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
+        self.kernel_chi_sum_block = func_mod.get_function("chi_sum_block") 
+        self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1472,12 +1563,12 @@ class ptycho_trans(object):
     def cal_chi_error_gpu(self, it):
 	t1 = time.time()
         chi = 0.0
-        scale=np.sqrt(1.*self.nx_prb*self.ny_prb)
-        chi_tmp = np.empty_like(self.product)
+        scale_sqrt=np.sqrt(1.*self.nx_prb*self.ny_prb)
+        scale = np.int32(self.nx_prb*self.ny_prb )
+#        chi_tmp_cpu = np.empty_like(self.product)
 
-        myprb,myobj = self.prb, self.obj 
-        cuda.memcpy_htod(self.prb_d, myprb )
-        cuda.memcpy_htod(self.obj_d, myobj )
+        cuda.memcpy_htod(self.prb_d, self.prb )
+        cuda.memcpy_htod(self.obj_d, self.obj )
 
 
         block_size = self.ny_prb
@@ -1504,21 +1595,67 @@ class ptycho_trans(object):
 	cuda.Context.synchronize()
         t1=time.time()
         self.elaps[11] += t1-t3
-        chi_tmp =self.fft_tmp_d.get()
+#        chi_tmp_cpu =self.fft_tmp_d.get()
 
 	cuda.Context.synchronize()
-#        chi_d = gpuarray.zero((
-#        self.kernel_chi_chi(self.fft_tmp_d, self.diff_array, scale_d, self.diff_sum_d, chi_d )
-#        chi=gpuarray.get(chi_d)[0]                          
         t0 = time.time()
+
 	self.elaps[12] += t0-t1
 
+        # choose a block size for calculate chi sum for each  block.
+        # it will end up with nblock numbers 
+        block_size=1024
+        nblocks = (self.nx_prb * self.ny_prb* self.num_points -1 )/block_size + 1
 
-        for i in range(self.num_points):
-            tmp = np.sum((np.abs(chi_tmp[i])/scale - self.diff_array[i])**2)
-            chi += tmp/self.diff_sum_sq[i]
+        chi_tmp=np.zeros((nblocks,),dtype=np.float64) 
+        buff =gpuarray.empty(np.shape(chi_tmp),dtype=np.float64)
+        self.kernel_chi_sum_block(self.fft_tmp_d, self.diff_d, self.diff_sum_sq_d, buff, \
+            scale, block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
+	cuda.Context.synchronize()
+
+        chi_tmp = buff.get() 
+#        print "chi_tmp[0:16]", chi_tmp[0:16], np.sum(chi_tmp[0:16])
         
-        self.elaps[7] += time.time()-t0 
+#        tmp1 = abs(chi_tmp_cpu[0,0,:])/scale_sqrt 
+#       print  tmp1[0], self.diff_array[0,0,0], (tmp1[0]- self.diff_array[0,0,0]) **2/self.diff_sum_sq[0]   
+#        print (tmp1- self.diff_array[0,0,:]) **2/self.diff_sum_sq[0] 
+#        print "sum =" , np.sum((tmp1- self.diff_array[0,0,:]) **2/self.diff_sum_sq[0])
+        
+#        for i in range(16):
+#            tmp =np.sum(np.abs(chi_tmp_cpu[0,i*8:(i+1)*8,:])/scale_sqrt-self.diff_array[0,i*8:(i+1)*8,:])**2/self.diff_sum_sq[0]
+#            print "cpu chi[%s] %% i " , tmp, self.diff_sum_sq[0]
+        
+        '''
+        for i in range(self.num_points):
+
+            tmp = np.sum((abs(chi_tmp_cpu[i])/scale_sqrt -self.diff_array[i])**2)/self.diff_sum_sq[i] 
+            print "16 blockss, i=%s ,gpu, cpu %% i", np.sum(chi_tmp[i*16:(i+1)*16]), tmp
+        '''
+        ### number of GOU blocks for futher reduce to nblock_reduce numbers
+        nblock_reduce=(nblocks-1)/block_size +1 
+
+        print "nblcok_reduce =" , nblocks,nblock_reduce,block_size
+        
+                
+        '''
+        buff = cuda.mem_alloc(nblock_reduce*8  )        
+        self.kernel_chi_reduce(self.prb_obj_d, buff, np.int32(nblocks),\
+            block=(block_size, 1,1 ) , grid=(nblock_reduce,1,1 ), shared=block_size*8 )
+
+        chi_tmp=np.empty(nblock_reduce,dtype=np.float64) 
+        cuda.memcpy_dtoh(chi_tmp, buff) 
+        '''
+	cuda.Context.synchronize()
+        t5 = time.time()
+        self.elaps[6] += t5-t0
+        
+        chi = np.sum(chi_tmp) 
+        '''
+        for i in range(self.num_points):
+            tmp = np.sum((np.abs(chi_tmp[i])/scale_sqrt - self.diff_array[i])**2)
+            chi += tmp/self.diff_sum_sq[i]
+        '''        
+        self.elaps[7] += time.time()-t5 
              
         self.error_chi[it] = np.sqrt(chi/self.num_points)
 
