@@ -42,6 +42,8 @@ def recon(scan_num,sign,n_iterations,p_flag, processes,gpu_flag):
     lambda_nm = np.array(f['lambda_nm'])
     f.close()
 
+    nz, nx , ny =np.shape(diffmap)
+
 
     kernal_n = 32
     recon = ptycho_trans(diffamp)  
