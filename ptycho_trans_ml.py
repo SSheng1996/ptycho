@@ -223,6 +223,7 @@ class ptycho_trans(object):
         self.kernel_chi_prb_obj = None 
         self.kernel_chi_sum_block = None 
         self.kernel_chi_reduce = None 
+        self.kernel_dm_prb_obj = None 
         self.plan_f = None
         self.plan_r = None
         
@@ -246,6 +247,7 @@ class ptycho_trans(object):
 #        self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
         self.prb_obj_d = gpuarray.empty(np.shape(self.product),dtype=np.complex128)       
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
+        self.product_d = gpuarray.empty_like(self.prb_obj_d)
         self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.num_points)
 
@@ -364,11 +366,41 @@ class ptycho_trans(object):
 
         }
 
+        extern "C" {
+        __global__ void dm_prb_obj(cuDoubleComplex *prb, cuDoubleComplex *obj, cuDoubleComplex *prb_obj, cuDoubleComplex* product , cuDoubleComplex* tmp_fft, int * point_info, int  nx, int ny ,int o_ny, int points  )
+        {
+
+
+        int i = blockIdx.x/nx ;
+        int x = blockIdx.x % nx ;
+        int xstart = point_info[i*4];
+        int ystart = point_info[i*4+2];
+
+        
+
+        int tid = threadIdx.x ;
+
+        int idx_p = tid + x* ny ;
+        int idx_o = tid + (x  + xstart )*o_ny + ystart ;
+        int idx_po = idx_p + i * nx * ny ;
+
+        cuDoubleComplex result = cuCmul(prb[idx_p],obj[idx_o]) ;
+        prb_obj[idx_po] = result ;
+        tmp_fft[idx_po] =  cuCsub( cuCadd(result,result) , product[idx_po] ) ; 
+        
+
+
+        }
+        }
+
+
         """, no_extern_c=1)
 
         self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
         self.kernel_chi_sum_block = func_mod.get_function("chi_sum_block") 
         self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
+        self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
+        self.kernel_dm_prb_obj = func_mod.get_function("dm_prb_obj") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -818,21 +850,81 @@ class ptycho_trans(object):
             product += result
 
     def recon_dm_trans_gpu(self):
-        self.prb_d = gpuarray.to_gpu(self.prb)
-        self.obj_d = gpuarray.to_gpu(self.obj)
-        self.prb_obj_d = gpuarray.empty((self.num_points,self.nx_prb,self.ny_prb), dtype=np.complex128 ) 
+         
+        #load Obj and Prb to GPU
+        cuda.memcpy_htod(self.prb_d, self.prb )
+        cuda.memcpy_htod(self.obj_d, self.obj )
+
+        #load product to GPU, this is not needed if all calculate is in GPU.
+        product=np.array(self.product)
+        self.product_d.set(product)
+
+        #decide kernel block size to use 
+        #currently use  ny_prb
+        block_size = self.ny_prb
+
+        #number of blocks (grid size) for kernel launch
+        n_blocks = (self.num_points*self.nx_prb*self.ny_prb-1)/block_size +1
+
+        #need to make is into numpy array to pass as argument to pycuda kernel launcher
+        nx = np.int32(self.nx_prb)
+        ny = np.int32(self.ny_prb)
+        o_ny = np.int32(self.ny_obj)
+        points = np.int32(self.num_points)
+
+        #launch kernel calculate obj*prb store in prb_obj_d and 2PO-Psi in fft_tmp_d
+        self.kernel_dm_prb_obj(self.prb_d, self.obj_d, self.prb_obj_d, self.product_d, self.fft_tmp_d, self.point_info_d, \
+                nx, ny, o_ny, points, \
+                block=(block_size,1,1), grid=(n_blocks,1,1) )
+
         
-        stream = []
-        for i in range(self.num_points) :
-            stream.append(cuda.Stream)
-            self.diff_d[i,:] = gpuarray.to_gpu_async(self.diff_array, stream=stream[i])
-            x_start, x_end, y_start,y_end = self.point_info[i] 
-            prb_m_obj(i, x_start, x_end , y_start,y_end, \
-                self.nx_obj,self.ny_obj,self.nx_prb,self.ny_prb, 
-                block=(self.block_size,1,1), stream=stream[i], grid=(self.grid_size,1,1) )
+        #do in space fft on 2PO-Psi
+        cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
+
+
+        fft_tmp=self.fft_tmp_d.get()
+        prb_obj=self.prb_obj_d.get() 
+
+        for i in range(self.num_points):
             
-            
-                    
+            x_start, x_end, y_start, y_end = self.point_info[i]
+            diff = self.diff_array[i]
+
+            if np.sum(diff) > 0.:
+
+                tmp_fft = fft_tmp[i] / np.sqrt(self.nx_prb*self.ny_prb)
+
+                amp_tmp = np.abs(tmp_fft)
+                ph_tmp = tmp_fft / (amp_tmp + self.sigma1)
+
+                index_x, index_y = np.where(diff >= 0.)
+                dev = amp_tmp - diff
+                power = np.sum((dev[index_x, index_y]) ** 2) / (self.nx_prb * self.ny_prb)
+
+                if power > self.sigma2:
+                    a = diff + dev * np.sqrt(self.sigma2 / power)
+                    amp_tmp[index_x, index_y] = a[index_x, index_y]
+
+                tmp2 = ifftn(amp_tmp * ph_tmp) * np.sqrt(self.nx_prb*self.ny_prb)
+                self.product[i] += self.beta * (tmp2 - prb_obj[i])
+        else:
+            self.product[i] = prb_obj[i]
+
+
+        #second kernel  store dev =amp_tmp-diff reduce sum(dev**2) in blocks.
+        
+
+        # cpu calculate power or futher gpu reduce if points are a lot .
+
+
+        #kernel prepare ifft 
+
+
+        # kernel calculate psi += beta * (psi-P.O)
+
+ 
+        
+
 
     # difference map for multislice case, only updates exitwaves on the last plane
     def recon_dm_trans_ms(self):
@@ -1612,9 +1704,17 @@ class ptycho_trans(object):
         self.kernel_chi_sum_block(self.fft_tmp_d, self.diff_d, self.diff_sum_sq_d, buff, \
             scale, block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
 	cuda.Context.synchronize()
-
+        t5 = time.time()
         chi_tmp = buff.get() 
-        
+
+        '''
+        # Not sure why it took very long time to do gpuarray.sum
+        t11=time.time()
+        chi_g=gpuarray.sum(buff)
+        chi=float(chi_g.get()) 
+        print "chi gpu=", chi
+        print "time " , time.time()-t11
+        '''
         ### number of GOU blocks for futher reduce to nblock_reduce numbers
         nblock_reduce=(nblocks-1)/block_size +1 
 
@@ -1628,10 +1728,10 @@ class ptycho_trans(object):
         cuda.memcpy_dtoh(chi_tmp, buff) 
         '''
 	cuda.Context.synchronize()
-        t5 = time.time()
         self.elaps[6] += t5-t0
         
         chi = np.sum(chi_tmp) 
+        print "chi cpu=", chi
         '''
         for i in range(self.num_points):
             tmp = np.sum((np.abs(chi_tmp[i])/scale_sqrt - self.diff_array[i])**2)
@@ -2071,7 +2171,10 @@ class ptycho_trans(object):
                         self.recon_ml_trans()
                         print('ML')
                     elif self.alg2_flag == 'DM':
-                        self.recon_dm_trans()
+                        if( self.gpu_flag ):
+                            self.recon_dm_trans_gpu()
+                        else:
+                            self.recon_dm_trans()
                         print('DM')
                     elif self.alg2_flag == 'DM_real':
                         self.recon_dm_trans_real()
@@ -2084,7 +2187,10 @@ class ptycho_trans(object):
                         self.recon_ml_trans()
                         print('ML')
                     elif self.alg_flag == 'DM':
-                        self.recon_dm_trans()
+                        if( self.gpu_flag ):
+                            self.recon_dm_trans_gpu()
+                        else:
+                            self.recon_dm_trans()
                         print('DM')
                     elif self.alg_flag == 'DM_real':
                         self.recon_dm_trans_real()

@@ -42,7 +42,7 @@ def recon(scan_num,sign,n_iterations,p_flag, processes,gpu_flag):
     lambda_nm = np.array(f['lambda_nm'])
     f.close()
 
-    nz, nx , ny =np.shape(diffmap)
+    nz, nx , ny =np.shape(diffamp)
 
 
     kernal_n = 32
@@ -54,7 +54,7 @@ def recon(scan_num,sign,n_iterations,p_flag, processes,gpu_flag):
 
     recon.start_ave = 0.8
     recon.scan_num = scan_num  #scan number
-    recon.online_flag = Ture
+    recon.online_flag = True
     #recon.tif_threshold = threshold
     recon.sign = sign      #saving file name
     recon.x_range_um = x_range        #scan range in x direction (um)
