@@ -229,7 +229,7 @@ class ptycho_trans(object):
         
          
         #for timing
-        self.elaps=[0.0]*13
+        self.elaps=[0.0]*15
 
         if self.sf_flag:
             self.use_scipy_fft()
@@ -850,7 +850,9 @@ class ptycho_trans(object):
             product += result
 
     def recon_dm_trans_gpu(self):
-         
+
+        t0=time.time()
+ 
         #load Obj and Prb to GPU
         cuda.memcpy_htod(self.prb_d, self.prb )
         cuda.memcpy_htod(self.obj_d, self.obj )
@@ -880,10 +882,15 @@ class ptycho_trans(object):
         
         #do in space fft on 2PO-Psi
         cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
-
+	
 
         fft_tmp=self.fft_tmp_d.get()
         prb_obj=self.prb_obj_d.get() 
+
+        cuda.Context.synchronize()
+		
+        t1=time.time()
+        self.elaps[13] += t1-t0
 
         for i in range(self.num_points):
             
@@ -907,8 +914,11 @@ class ptycho_trans(object):
 
                 tmp2 = ifftn(amp_tmp * ph_tmp) * np.sqrt(self.nx_prb*self.ny_prb)
                 self.product[i] += self.beta * (tmp2 - prb_obj[i])
-        else:
-            self.product[i] = prb_obj[i]
+            else:
+                self.product[i] = prb_obj[i]
+		
+        t0=time.time()
+        self.elaps[14] += t0-t1
 
 
         #second kernel  store dev =amp_tmp-diff reduce sum(dev**2) in blocks.
