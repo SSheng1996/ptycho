@@ -229,7 +229,7 @@ class ptycho_trans(object):
         
          
         #for timing
-        self.elaps=[0.0]*15
+        self.elaps=[0.0]*18
 
         if self.sf_flag:
             self.use_scipy_fft()
@@ -861,6 +861,12 @@ class ptycho_trans(object):
         product=np.array(self.product)
         self.product_d.set(product)
 
+        cuda.Context.synchronize()
+		
+        t1=time.time()
+        self.elaps[13] += t1-t0
+
+
         #decide kernel block size to use 
         #currently use  ny_prb
         block_size = self.ny_prb
@@ -879,10 +885,22 @@ class ptycho_trans(object):
                 nx, ny, o_ny, points, \
                 block=(block_size,1,1), grid=(n_blocks,1,1) )
 
+
+        cuda.Context.synchronize()
+		
+        t0=time.time()
+        self.elaps[14] += t0-t1
+
         
         #do in space fft on 2PO-Psi
         cu_fft.fft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f )
 	
+
+        cuda.Context.synchronize()
+		
+        t3=time.time()
+        self.elaps[15] += t3-t0
+
 
         fft_tmp=self.fft_tmp_d.get()
         prb_obj=self.prb_obj_d.get() 
@@ -890,7 +908,7 @@ class ptycho_trans(object):
         cuda.Context.synchronize()
 		
         t1=time.time()
-        self.elaps[13] += t1-t0
+        self.elaps[16] += t1-t3
 
         for i in range(self.num_points):
             
@@ -918,7 +936,7 @@ class ptycho_trans(object):
                 self.product[i] = prb_obj[i]
 		
         t0=time.time()
-        self.elaps[14] += t0-t1
+        self.elaps[17] += t0-t1
 
 
         #second kernel  store dev =amp_tmp-diff reduce sum(dev**2) in blocks.
