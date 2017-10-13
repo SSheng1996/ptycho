@@ -217,6 +217,9 @@ class ptycho_trans(object):
         self.points_info_d = None
         self.prb_obj_d = None 
         self.diff_d = None
+        self.amp_tmp_d = None
+        self.power_d = None
+        self.dev_buff_d = None
 	self.plan = None
         self.diff_sum_sq = None
         self.diff_sum_sq_d = None
@@ -224,12 +227,15 @@ class ptycho_trans(object):
         self.kernel_chi_sum_block = None 
         self.kernel_chi_reduce = None 
         self.kernel_dm_prb_obj = None 
+        self.kernel_dm_cal_dev = None 
+        self.kernel_dm_reduce_dev = None 
         self.plan_f = None
         self.plan_r = None
         
+        
          
         #for timing
-        self.elaps=[0.0]*18
+        self.elaps=[0.0]*19
 
         if self.sf_flag:
             self.use_scipy_fft()
@@ -248,8 +254,11 @@ class ptycho_trans(object):
         self.prb_obj_d = gpuarray.empty(np.shape(self.product),dtype=np.complex128)       
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
         self.product_d = gpuarray.empty_like(self.prb_obj_d)
+        self.amp_tmp_d = gpuarray.empty_like(self.diff_d)
         self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.num_points)
+        self.dev_buff_d = gpuarray.empty((self.num_points,self.nx_prb),dtype=np.float64)
+        self.power_d = gpuarray.empty((self.num_points,), dtype=np.float64 )
 
 
         func_mod = SourceModule("""
@@ -337,7 +346,7 @@ class ptycho_trans(object):
 
 
         
-        unsigned int tid = blockIdx.x ;
+        unsigned int tid = threadIdx.x ;
         sdata[0] = 0.0 ;
         unsigned int i = tid + blockDim.x * blockIdx.x  ;
         if ( i < N ) 
@@ -394,6 +403,100 @@ class ptycho_trans(object):
         }
 
 
+        extern "C" {
+        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_tmp , int  nx , double sigma1 )
+        {
+        extern __shared__ double sdata[] ; 
+        
+        unsigned int tid = threadIdx.x ;
+        unsigned long idx=tid+blockDim.x*blockIdx.x ;
+        unsigned int i = blockIdx.x /nx ;
+        double scale =  double(nx*blockDim.x) ;
+        double scale_sqrt = sqrt(scale) ;
+        cuDoubleComplex  fft = cuCmul(fft_tmp[idx], make_cuDoubleComplex(1.0/scale_sqrt,0.0))  ;
+        double amp = cuCabs( fft );
+        cuDoubleComplex ph = cuCmul(fft, make_cuDoubleComplex(1.0/(amp+sigma1),0.0) ) ;
+        fft_tmp[idx] = ph ;
+         
+        
+        amp_tmp[idx] = amp ;
+        if( diff[idx] >= 0.0 ) {
+        double dev = amp - diff[idx ] ;
+        sdata[tid] = dev * dev ;
+        __syncthreads();
+
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        {
+            if (tid < s) {
+            sdata[tid] += sdata[tid + s];}
+            __syncthreads();
+        }
+        if (tid < 32)
+        {
+        sdata[tid] += sdata[tid + 32];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 16];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 8];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 4];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 2];
+            __syncthreads() ;
+        }
+
+        if ( tid == 0 ) 
+        dev_tmp[blockIdx.x] = (sdata[0]+sdata[1])/scale ;
+        
+        }
+        else 
+        dev_tmp[blockIdx.x] = 0.0 ; 
+
+
+        }
+        }
+
+        extern "C" {
+        __global__ void dm_reduce_dev(double* dev_tmp,  double * power   )
+        {
+        extern __shared__ double sdata[] ; 
+
+        
+        unsigned int tid = threadIdx.x ;
+        unsigned int idx = tid + blockDim.x * blockIdx.x  ;
+        sdata[tid] = dev_tmp[idx];
+        __syncthreads();
+
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        {
+            if (tid < s) {
+            sdata[tid] += sdata[tid + s];}
+            __syncthreads();
+        }
+        if (tid < 32)
+        {
+        sdata[tid] += sdata[tid + 32];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 16];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 8];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 4];
+            __syncthreads() ;
+        sdata[tid] += sdata[tid + 2];
+            __syncthreads() ;
+        }
+
+        if ( tid == 0 ) 
+        power[blockIdx.x] =sdata[0] + sdata[1] ;
+
+
+        
+
+        }
+        }
+
+
         """, no_extern_c=1)
 
         self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
@@ -401,6 +504,8 @@ class ptycho_trans(object):
         self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_dm_prb_obj = func_mod.get_function("dm_prb_obj") 
+        self.kernel_dm_cal_dev = func_mod.get_function("dm_cal_dev") 
+        self.kernel_dm_reduce_dev = func_mod.get_function("dm_reduce_dev") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -898,17 +1003,48 @@ class ptycho_trans(object):
 
         cuda.Context.synchronize()
 		
-        t3=time.time()
-        self.elaps[15] += t3-t0
+        t1=time.time()
+        self.elaps[15] += t1-t0
 
 
-        fft_tmp=self.fft_tmp_d.get()
+
+        #second kernel  store dev =amp_tmp-diff reduce sum(dev**2) in blocks.
+        
+        block_size = self.ny_prb 
+        n_blocks = self.num_points * self.nx_prb 
+        sigma1 = np.float64(self.sigma1) 
+        self.kernel_dm_cal_dev(self.fft_tmp_d, self.amp_tmp_d, self.diff_d, self.dev_buff_d, nx ,  \
+                sigma1,
+                block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.ny_prb* 8 ) 
+		
+        cuda.Context.synchronize()
+        t0=time.time()
+        self.elaps[16] += t0-t1
+
+        # cpu calculate power or futher gpu reduce if points are a lot .
+
+        block_size = self.nx_prb
+        n_blocks = self.num_points
+
+        self.kernel_dm_reduce_dev(self.dev_buff_d, self.power_d ,
+                block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.nx_prb* 8 ) 
+
+
+        #fft_tmp=self.fft_tmp_d.get()
+        ph_tmp=self.fft_tmp_d.get()
         prb_obj=self.prb_obj_d.get() 
+        amp_tmp_a = self.amp_tmp_d.get() 
+        
+        #dev_buff=self.dev_buff_d.get()
 
         cuda.Context.synchronize()
 		
         t1=time.time()
-        self.elaps[16] += t1-t3
+        self.elaps[17] += t1-t0
+
+
+        #power = np.sum(dev_buff,1 ) 
+        power = self.power_d.get() 
 
         for i in range(self.num_points):
             
@@ -917,32 +1053,26 @@ class ptycho_trans(object):
 
             if np.sum(diff) > 0.:
 
-                tmp_fft = fft_tmp[i] / np.sqrt(self.nx_prb*self.ny_prb)
+                #tmp_fft = fft_tmp[i] / np.sqrt(self.nx_prb*self.ny_prb)
 
-                amp_tmp = np.abs(tmp_fft)
-                ph_tmp = tmp_fft / (amp_tmp + self.sigma1)
-
+                #amp_tmp = np.abs(tmp_fft)
+                #ph_tmp = tmp_fft / (amp_tmp + self.sigma1)
+                amp_tmp = amp_tmp_a[i]
                 index_x, index_y = np.where(diff >= 0.)
                 dev = amp_tmp - diff
-                power = np.sum((dev[index_x, index_y]) ** 2) / (self.nx_prb * self.ny_prb)
+                #power = np.sum((dev[index_x, index_y]) ** 2) / (self.nx_prb * self.ny_prb)
 
-                if power > self.sigma2:
-                    a = diff + dev * np.sqrt(self.sigma2 / power)
+                if power[i] > self.sigma2:
+                    a = diff + dev * np.sqrt(self.sigma2 / power[i])
                     amp_tmp[index_x, index_y] = a[index_x, index_y]
 
-                tmp2 = ifftn(amp_tmp * ph_tmp) * np.sqrt(self.nx_prb*self.ny_prb)
+                tmp2 = ifftn(amp_tmp * ph_tmp[i]) * np.sqrt(self.nx_prb*self.ny_prb)
                 self.product[i] += self.beta * (tmp2 - prb_obj[i])
             else:
                 self.product[i] = prb_obj[i]
 		
         t0=time.time()
-        self.elaps[17] += t0-t1
-
-
-        #second kernel  store dev =amp_tmp-diff reduce sum(dev**2) in blocks.
-        
-
-        # cpu calculate power or futher gpu reduce if points are a lot .
+        self.elaps[18] += t0-t1
 
 
         #kernel prepare ifft 
