@@ -220,7 +220,7 @@ class ptycho_trans(object):
         self.amp_tmp_d = None
         self.power_d = None
         self.dev_buff_d = None
-	self.plan = None
+        self.dev_d = None
         self.diff_sum_sq = None
         self.diff_sum_sq_d = None
         self.kernel_chi_prb_obj = None 
@@ -229,6 +229,7 @@ class ptycho_trans(object):
         self.kernel_dm_prb_obj = None 
         self.kernel_dm_cal_dev = None 
         self.kernel_dm_reduce_dev = None 
+        self.kernel_dm_k4 = None 
         self.plan_f = None
         self.plan_r = None
         
@@ -255,6 +256,7 @@ class ptycho_trans(object):
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
         self.product_d = gpuarray.empty_like(self.prb_obj_d)
         self.amp_tmp_d = gpuarray.empty_like(self.diff_d)
+        self.dev_d = gpuarray.empty_like(self.diff_d)
         self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.num_points)
         self.dev_buff_d = gpuarray.empty((self.num_points,self.nx_prb),dtype=np.float64)
@@ -404,7 +406,7 @@ class ptycho_trans(object):
 
 
         extern "C" {
-        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_tmp , int  nx , double sigma1 )
+        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_d, double* dev_tmp , int  nx , double sigma1 )
         {
         extern __shared__ double sdata[] ; 
         
@@ -422,6 +424,7 @@ class ptycho_trans(object):
         amp_tmp[idx] = amp ;
         if( diff[idx] >= 0.0 ) {
         double dev = amp - diff[idx ] ;
+        dev_d[idx] = dev ;
         sdata[tid] = dev * dev ;
         __syncthreads();
 
@@ -491,11 +494,28 @@ class ptycho_trans(object):
         power[blockIdx.x] =sdata[0] + sdata[1] ;
 
 
+        }
+        }
+
         
+        extern "C" {
+        __global__ void dm_k4(double* diff, double* dev, double * power, double* amp, cuDoubleComplex* fft_tmp, double sigma2, int nx  )
+        {
+
+        unsigned int tid = threadIdx.x ;
+        unsigned int idx = tid + blockDim.x * blockIdx.x  ;
+        int i = blockIdx.x /nx ;
+
+        double amp_tmp = amp[idx] ;
+        
+        if( diff[idx] >= 0.0 && power[i] > sigma2 ) 
+            amp_tmp = diff[idx] + dev[idx] * sqrt ( sigma2/power[i] ) ;
+        
+        fft_tmp[idx] = cuCmul(fft_tmp[idx], make_cuDoubleComplex(amp_tmp, 0.0) ) ; 
+       
 
         }
         }
-
 
         """, no_extern_c=1)
 
@@ -506,6 +526,7 @@ class ptycho_trans(object):
         self.kernel_dm_prb_obj = func_mod.get_function("dm_prb_obj") 
         self.kernel_dm_cal_dev = func_mod.get_function("dm_cal_dev") 
         self.kernel_dm_reduce_dev = func_mod.get_function("dm_reduce_dev") 
+        self.kernel_dm_k4 = func_mod.get_function("dm_k4") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1013,7 +1034,7 @@ class ptycho_trans(object):
         block_size = self.ny_prb 
         n_blocks = self.num_points * self.nx_prb 
         sigma1 = np.float64(self.sigma1) 
-        self.kernel_dm_cal_dev(self.fft_tmp_d, self.amp_tmp_d, self.diff_d, self.dev_buff_d, nx ,  \
+        self.kernel_dm_cal_dev(self.fft_tmp_d, self.amp_tmp_d, self.diff_d, self.dev_d,  self.dev_buff_d, nx ,  \
                 sigma1,
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.ny_prb* 8 ) 
 		
@@ -1031,42 +1052,60 @@ class ptycho_trans(object):
 
 
         #fft_tmp=self.fft_tmp_d.get()
-        ph_tmp=self.fft_tmp_d.get()
-        prb_obj=self.prb_obj_d.get() 
-        amp_tmp_a = self.amp_tmp_d.get() 
+        #ph_tmp=self.fft_tmp_d.get()
+        #prb_obj=self.prb_obj_d.get() 
+        #amp_tmp_a = self.amp_tmp_d.get() 
         
         #dev_buff=self.dev_buff_d.get()
+
+        # calculate diff+dev*sqrt(sigma2/power) 
+        block_size = self.ny_prb
+        n_blocks = self.num_points*self.nx_prb
+        sigma2=np.float64(self.sigma2)
+        
+        self.kernel_dm_k4(self.diff_d, self.dev_d, self.power_d, self.amp_tmp_d , self.fft_tmp_d, sigma2, nx, \
+                block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) )
+
+
+
+        # inverse fft
+        cu_fft.ifft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f, True )
+        
+
+        fft_tmp=self.fft_tmp_d.get()
+        prb_obj=self.prb_obj_d.get() 
+
+        #power = np.sum(dev_buff,1 ) 
+        #power = self.power_d.get() 
 
         cuda.Context.synchronize()
 		
         t1=time.time()
         self.elaps[17] += t1-t0
-
-
-        #power = np.sum(dev_buff,1 ) 
-        power = self.power_d.get() 
-
+        
         for i in range(self.num_points):
             
-            x_start, x_end, y_start, y_end = self.point_info[i]
+            #x_start, x_end, y_start, y_end = self.point_info[i]
             diff = self.diff_array[i]
 
             if np.sum(diff) > 0.:
 
+                #tmp2 = ifftn(fft_tmp[i]) * np.sqrt(self.nx_prb*self.ny_prb)
+                tmp2 = fft_tmp[i] * np.sqrt(self.nx_prb*self.ny_prb)
                 #tmp_fft = fft_tmp[i] / np.sqrt(self.nx_prb*self.ny_prb)
 
                 #amp_tmp = np.abs(tmp_fft)
                 #ph_tmp = tmp_fft / (amp_tmp + self.sigma1)
-                amp_tmp = amp_tmp_a[i]
-                index_x, index_y = np.where(diff >= 0.)
-                dev = amp_tmp - diff
+                #amp_tmp = amp_tmp_a[i]
+                #index_x, index_y = np.where(diff >= 0.)
+                #dev = amp_tmp - diff
                 #power = np.sum((dev[index_x, index_y]) ** 2) / (self.nx_prb * self.ny_prb)
 
-                if power[i] > self.sigma2:
-                    a = diff + dev * np.sqrt(self.sigma2 / power[i])
-                    amp_tmp[index_x, index_y] = a[index_x, index_y]
+                #if power[i] > self.sigma2:
+                #   a = diff + dev * np.sqrt(self.sigma2 / power[i])
+                #  amp_tmp[index_x, index_y] = a[index_x, index_y]
 
-                tmp2 = ifftn(amp_tmp * ph_tmp[i]) * np.sqrt(self.nx_prb*self.ny_prb)
+                #tmp2 = ifftn(amp_tmp * ph_tmp[i]) * np.sqrt(self.nx_prb*self.ny_prb)
                 self.product[i] += self.beta * (tmp2 - prb_obj[i])
             else:
                 self.product[i] = prb_obj[i]
