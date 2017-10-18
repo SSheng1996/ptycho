@@ -230,6 +230,7 @@ class ptycho_trans(object):
         self.kernel_dm_cal_dev = None 
         self.kernel_dm_reduce_dev = None 
         self.kernel_dm_k4 = None 
+        self.kernel_dm_k5 = None 
         self.plan_f = None
         self.plan_r = None
         
@@ -254,13 +255,18 @@ class ptycho_trans(object):
 #        self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
         self.prb_obj_d = gpuarray.empty(np.shape(self.product),dtype=np.complex128)       
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
-        self.product_d = gpuarray.empty_like(self.prb_obj_d)
+        #allocate memeory and load product (\psi) into GPU
+        #self.product_d = gpuarray.empty_like(self.prb_obj_d)
+        product=np.array(self.product)
+        self.product_d = gpuarray.to_gpu(product)
         self.amp_tmp_d = gpuarray.empty_like(self.diff_d)
         self.dev_d = gpuarray.empty_like(self.diff_d)
         self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.num_points)
         self.dev_buff_d = gpuarray.empty((self.num_points,self.nx_prb),dtype=np.float64)
         self.power_d = gpuarray.empty((self.num_points,), dtype=np.float64 )
+
+
 
 
         func_mod = SourceModule("""
@@ -516,6 +522,22 @@ class ptycho_trans(object):
 
         }
         }
+        
+        extern "C" {
+        __global__ void dm_k5(cuDoubleComplex* fft_tmp, cuDoubleComplex* product, cuDoubleComplex* obj_prb, int n,  double beta, double scale  )
+        {
+
+        unsigned int tid = threadIdx.x ;
+        unsigned int idx = tid + blockDim.x * blockIdx.x  ;
+
+        if( idx < n) { 
+        cuDoubleComplex tmp = cuCmul(fft_tmp[idx],make_cuDoubleComplex(scale,0.0) );
+        cuDoubleComplex tmp2 = cuCmul(cuCsub(tmp, obj_prb[idx]) , make_cuDoubleComplex(beta,0.0 ) ) ;
+        product[idx] = cuCadd(product[idx], tmp2) ;
+        }
+
+        }
+        }
 
         """, no_extern_c=1)
 
@@ -527,6 +549,7 @@ class ptycho_trans(object):
         self.kernel_dm_cal_dev = func_mod.get_function("dm_cal_dev") 
         self.kernel_dm_reduce_dev = func_mod.get_function("dm_reduce_dev") 
         self.kernel_dm_k4 = func_mod.get_function("dm_k4") 
+        self.kernel_dm_k5 = func_mod.get_function("dm_k5") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -984,8 +1007,8 @@ class ptycho_trans(object):
         cuda.memcpy_htod(self.obj_d, self.obj )
 
         #load product to GPU, this is not needed if all calculate is in GPU.
-        product=np.array(self.product)
-        self.product_d.set(product)
+        #product=np.array(self.product)
+        #self.product_d.set(product)
 
         cuda.Context.synchronize()
 		
@@ -1070,10 +1093,23 @@ class ptycho_trans(object):
 
         # inverse fft
         cu_fft.ifft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f, True )
+
+        
+        # final update \psi
+
+        beta = np.float64(self.beta) 
+        scale = np.float64(np.sqrt(self.nx_prb * self.ny_prb)) 
+        n = np.int32(self.num_points * self.nx_prb * self.ny_prb)
+        block_size =128
+        n_blocks = (n -1 )/block_size +1 
+        self.kernel_dm_k5(self.fft_tmp_d, self.product_d, self.prb_obj_d,  \
+                n, beta, scale, \
+                block=( block_size, 1,1) , grid=(n_blocks, 1,1 ) )
         
 
-        fft_tmp=self.fft_tmp_d.get()
-        prb_obj=self.prb_obj_d.get() 
+
+        #fft_tmp=self.fft_tmp_d.get()
+        #prb_obj=self.prb_obj_d.get() 
 
         #power = np.sum(dev_buff,1 ) 
         #power = self.power_d.get() 
@@ -1082,7 +1118,9 @@ class ptycho_trans(object):
 		
         t1=time.time()
         self.elaps[17] += t1-t0
-        
+
+        self.product=self.product_d.get()
+        '''
         for i in range(self.num_points):
             
             #x_start, x_end, y_start, y_end = self.point_info[i]
@@ -1109,7 +1147,7 @@ class ptycho_trans(object):
                 self.product[i] += self.beta * (tmp2 - prb_obj[i])
             else:
                 self.product[i] = prb_obj[i]
-		
+	'''	
         t0=time.time()
         self.elaps[18] += t0-t1
 
