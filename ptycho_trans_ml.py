@@ -223,6 +223,8 @@ class ptycho_trans(object):
         self.dev_d = None
         self.diff_sum_sq = None
         self.diff_sum_sq_d = None
+        self.prb_upd_d = None
+        self.norm_obj_d = None
         self.kernel_chi_prb_obj = None 
         self.kernel_chi_sum_block = None 
         self.kernel_chi_reduce = None 
@@ -231,6 +233,8 @@ class ptycho_trans(object):
         self.kernel_dm_reduce_dev = None 
         self.kernel_dm_k4 = None 
         self.kernel_dm_k5 = None 
+        self.kernel_prob_trans = None
+        self.kernel_prob_reduce = None
         self.plan_f = None
         self.last = None
         self.plan_last = None
@@ -255,10 +259,10 @@ class ptycho_trans(object):
         self.diff_sum_sq = np.sum(self.diff_array**2, axis=(1,2))
         self.diff_sum_sq_d = gpuarray.to_gpu(self.diff_sum_sq)
         self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
-        #self.prb_d = gpuarray.empty(np.shape(self.prb),dtype=np.complex128) 
-        #self.obj_d = gpuarray.empty(np.shape(self.obj),dtype=np.complex128) 
-        self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
-        self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
+        self.prb_d = gpuarray.to_gpu(self.prb) 
+        self.obj_d = gpuarray.to_gpu(self.obj) 
+        #self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
+        #self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
         self.diff_d = gpuarray.to_gpu(self.diff_array)
 
         print "product type ", type(self.product) , np.shape(self.product)
@@ -269,11 +273,14 @@ class ptycho_trans(object):
         # complex temp buffs
         self.prb_obj_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb,self.ny_prb),dtype=np.complex128)       
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
+        self_prb_upd_d = gpuarray.empty_like(self.prb_d)
+
         #  float temp buffs
         self.amp_tmp_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb,self.ny_prb), dtype=np.float64)
         self.dev_d = gpuarray.empty_like(self.amp_tmp_d)
         self.dev_buff_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb),dtype=np.float64)
         self.power_d = gpuarray.empty((self.gpu_batch_size,), dtype=np.float64 )
+        self.obj_norm_d = gpuarray.empty(np.shape(self.prb), dtype=np.float64 )
 
         # make plan for cufft
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.gpu_batch_size)
@@ -556,6 +563,99 @@ class ptycho_trans(object):
 
         }
         }
+        
+        extern "C" {
+        __global__ void prb_trans(cuDoubleComplex* product, cuDoubleComplex obj, cuDoubleComplex * p_upd, double * norm_upd,  cuDoubleComplex* prb, double * norm, int * points_info, 
+        int size, int nx, int ny, int o_ny ,int offset  )
+        {
+        __shared__ cuDoubleComplex p[16][17] ;
+        __shared__ double n[16][17] ;
+
+        unsigned int idx_pr = threadIdx.x + blockIdx.x* blockDim.x ;
+        unsigned int x = idx_pr /ny ;
+        unsigned int y = idx_pr % ny ;
+        unsigned int i = threadIdx.y + blockIdx.y* blockDim.y ;
+        int xstart = point_info[(i+offset)*4];
+        int ystart = point_info[(i+offset)*4+2];
+        
+        unsigned int idx_o =  y + (x  + xstart )*o_ny + ystart ;
+        unsigned long int idx_product = idx_pr + (i+offset) * nx * ny ;
+        unsinged long idx_upd = idx_pr + blockIdx.y * nx * ny ;
+
+        
+
+        if( i < size &&  idx_pr < nx*ny ) { 
+        cuDoubleComplex o = obj[idx_o] ;
+        n[threadIdx.x][threadIdx.y] = cuCabs(o) * cuCabs(o) ; 
+        p[threadIdx.x][trheadIdx.y] = cuCmul(product[idx_product], cuConj(o)  );
+        } 
+        else { 
+        p[threadIdx.x][trheadIdx.y] = cuCmplex(0.0, 0.0) ;
+        n[threadIdx.x][trheadIdx.y] =0.0 ;
+        }
+        __syncthread() ;
+        
+        for (unsigned int s=blockDim.y/2; s>1; s>>=1)
+        {
+            if (threadIdx.y  < s) {
+            p[threadIdx.x][threadIdx.y] = cuCadd( p[threadIdx.x][threadIdx.y], p[threadIdx.x][threadIdx.y + s]) ;
+            n[threadIdx.x][threadIdx.y] += n[[threadIdx.x][threadIdx.y + s] ;  }
+            __syncthreads();
+        }
+        if (threadIdx.y == 0 && idx_pr < nx*ny  && gridDim.y > 1 )  {
+            p_upd[idx_upd] = cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) ; 
+            norm_upd[idx_upd] = n[threadIdx.x][0] + n[threadIdx.x][1] ;
+        } else if (threadIdx.y == 0 && idx_pr < nx*ny ) {
+            prb[idx_pr] = cuCadd(prb[idx_pr],  cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] )) ; 
+            norm[idx_pr] = norm[idx_pr] + n[threadIdx.x][0] + n[threadIdx.x][1] ;
+        }    
+
+        }
+        }
+        
+        extern "C" {
+        __global__ void prb_reduce(cuDoubleComplex* prb_upd, double * norm_upd,  cuDoubleComple* prb, double * norm,  int size, int prb_sz ,int offset  )
+        {
+        __shared__ cuDoubleComplex p[16][17]  ;
+        __shared__ double n[16][17] ;
+
+        unsigned int idx_pr = threadIdx.x + blockIdx.x* blockDim.x ;
+        unsigned int i = threadIdx.y + blockIdx.y* blockDim.y ;
+        unsigned long  idx_upd = idx_pr + i * prb_sz 
+
+        if ( idx_pr < prb_sz ) {
+        p[threadIdx.x][trheadIdx.y] = prb_upd[idx_upd]  ;
+        n[threadIdx.x][trheadIdx.y] = norm_upd[idx_upd] ;
+        }
+        else {
+        p[threadIdx.x][trheadIdx.y] = cuCmplex(0.0, 0.0) ;
+        n[threadIdx.x][trheadIdx.y] =0.0 ;
+        }
+        
+
+        __syncthread() ;
+
+        for (unsigned int s=blockDim.y/2; s>1; s>>=1)
+        {
+            if (threadIdx.y  < s) {
+            p[threadIdx.x][threadIdx.y] = cuCadd( p[threadIdx.x][threadIdx.y], p[threadIdx.x][threadIdx.y + s]) ;
+            n[threadIdx.x][threadIdx.y] += n[[threadIdx.x][threadIdx.y + s] ;  }
+            __syncthreads();
+        }
+        if (threadIdx.y == 0 && idx_pr < prb_sz  )  {
+            if (offset != 0 ) {
+                prb[idx_prb] = cuCadd( prb[idx_prb], cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) );
+                norm[idx_prb] = norm[idx_prb] + n[threadIdx.x][0] + n[threadIdx.x][1] ;
+                } else {
+                prb[idx_pr] = cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) ;
+                norm[idx_pr] = n[threadIdx.x][0] + n[threadIdx.x][1] ;
+            }
+        }
+        
+    
+        }
+        }
+
 
         """, no_extern_c=1)
 
@@ -568,6 +668,8 @@ class ptycho_trans(object):
         self.kernel_dm_reduce_dev = func_mod.get_function("dm_reduce_dev") 
         self.kernel_dm_k4 = func_mod.get_function("dm_k4") 
         self.kernel_dm_k5 = func_mod.get_function("dm_k5") 
+        self.kernel_prob_trans = func_mod.get_function("prb_trans") 
+        self.kernel_prob_reduce = func_mod.get_function("prb_reduce") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1072,8 +1174,8 @@ class ptycho_trans(object):
 
     def recon_dm_trans_gpu(self ) :
         #load Obj and Prb to GPU, this is not needed if O and P update is done in GPU.
-        cuda.memcpy_htod(self.prb_d, self.prb )
-        cuda.memcpy_htod(self.obj_d, self.obj )
+        #cuda.memcpy_htod(self.prb_d, self.prb )
+        #cuda.memcpy_htod(self.obj_d, self.obj )
 
         n_batch = self.num_points/self.gpu_batch_size
         for i in range(n_batch) :
@@ -1522,39 +1624,62 @@ class ptycho_trans(object):
                 self.cal_probe_object_trans(j,'probe')
             '''
 
-    def cal_probe_trans_gpu(self):
+    def cal_probe_trans_gpu_single(self, start_point, size):
         
         #call gpu kernel for calculate prob_update and norm_obj partial sum over points.
         # using memory space allocated as self.obj_prb_d for prob_update
         # and use self.dev_d as space for norm_obj 
+        # write accumulated sum to  self.prb_upd_d, self.obj_norm_d,
         tile_pb = 16
-        tile_pt = 32
+        tile_pt = 16
         prb_size = self.nx_prb *self.ny_prb
-
-        n_pt = self.num_points
-
+        offset = np.int32(start_point)
 
         grid_pb = (prb_size-1)/tile_pb +1
-        grid_pt = (n_pt-1)/tile_pt +1 
+        grid_pt = (size-1)/tile_pt +1 
 
-        block_size = tile_pb * tile_pt
+        #block_size = tile_pb * tile_pt
         #nblocks = grid_pb * grid_pt  
+        nx = np.int32(self.nx_prb)
+        ny = np.int32(self.ny_prb)
+        o_ny = np.int32(self.ny_obj)
 
         self.kernel_prob_trans( self.product_d, self.obj_d, \
                 self.obj_prb_d, self.dev_d, \
-                np.int32(n_pt), np.int32(prb_size) , \
-                block=(tile_pb, tile_pt, 1 ) , grid = (grid_pb, grid_pt, 1) ,\
-                shared = block_size * 128 ) 
+                self.prb_upd_d, self.obj_norm_d, \
+                self.point_info, \
+                np.int32(size), nx,ny,o_ny , offset, \
+                block=(tile_pb, tile_pt, 1 ) , grid = (grid_pb, grid_pt, 1) )
 
+        
         #further reduce :
-        self.kernel_prob_reduce(self.obj_prb_d, self.dev_d , np.int32(grid_pt) ,\
-                block=(grid_pt, 1, 1) , grid=( prb_size, 1,1 ) ,\
-                shared = grid_pt * 196 )
+        #block_size = tile_pb * grid_pt
+        if  grid_pt > 1  :
+            self.kernel_prob_reduce(self.obj_prb_d, self.dev_d , self.prb_upd_d, self.obj_norm_d, int32(grid_pt) , np.int32(prb_size), offset,\
+                block=(tile_pb, grid_pt, 1) , grid=( grid_pb, 1,1 ) )
+
+    def cal_probe_trans_gpu(self) :
+
+
+        #load obj to GPU , only need before obj update is done in GPU
+        self.obj_d.set(self.obj) 
+
+        n_batch = self.num_points/self.gpu_batch_size 
+        
+        for i in range(n_batch) :
+            self.cal_probe_trans_gpu_single( i*self.gpu_batch_size, self.gpu_batch_size)
+
+        if self.last >0 :
+            self.cal_probe_trans_gpu_single( n_batch*self.gpu_batch_size, self.last )
+
 
         # read the prob_update and normal_obj out
-        self.prb = self.prb_d.get() 
-        
-
+        norm=self.obj_norm_d.get()
+        prb=self.prb_upd_d.get() 
+        #update prb
+        self.prb = prb/norm
+        # load back prb to GPU , this is necessary for multi GPU implementation later on
+        self.prb_d.set(self.prb)
         # 
 
 
@@ -2039,9 +2164,12 @@ class ptycho_trans(object):
 
     def cal_chi_error_gpu(self, it) :
         chi=0.0
-        n_batch = self.num_points/self.gpu_batch_size 
-        cuda.memcpy_htod(self.prb_d, self.prb )
-        cuda.memcpy_htod(self.obj_d, self.obj )
+        n_batch = self.num_points/self.gpu_batch_size
+         
+        self.prb_d.set(self.prb)
+        self.obj_d.set(self.obj) 
+        #cuda.memcpy_htod(self.prb_d, self.prb )
+        #cuda.memcpy_htod(self.obj_d, self.obj )
         for i in range(n_batch) :
             chi += self.chi_gpu_single( i*self.gpu_batch_size , self.gpu_batch_size ) 
         if  self.last > 0 :
@@ -2627,7 +2755,10 @@ class ptycho_trans(object):
                 if(it >= self.start_update_probe):
                     if(it >= self.start_update_object):
                         self.cal_object_trans()
-                        self.cal_probe_trans()
+                        if(self.gpu_flag) :
+                            self.cal_probe_trans_gpu() 
+                        else :
+                            self.cal_probe_trans()
                     else:
                         self.cal_probe_trans()
                 else:
