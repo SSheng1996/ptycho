@@ -235,6 +235,7 @@ class ptycho_trans(object):
         self.kernel_dm_k5 = None 
         self.kernel_prob_trans = None
         self.kernel_prob_reduce = None
+        self.kernel_obj_trans = None
         self.plan_f = None
         self.last = None
         self.plan_last = None
@@ -281,6 +282,7 @@ class ptycho_trans(object):
         self.dev_buff_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb),dtype=np.float64)
         self.power_d = gpuarray.empty((self.gpu_batch_size,), dtype=np.float64 )
         self.obj_norm_d = gpuarray.empty(np.shape(self.prb), dtype=np.float64 )
+        self.prb_norm_d = gpuarray.empty(np.shape(self.obj), dtype=np.float64 )
 
         # make plan for cufft
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.gpu_batch_size)
@@ -653,9 +655,35 @@ class ptycho_trans(object):
             }
         }
         
+        }
+        }
+        
+        extern "C" {
+        __global__ void prb_trans(cuDoubleComplex* product, cuDoubleComplex* obj, cuDoubleComplex * prb,   double * norm, int * point_info, 
+         double alpha, int o_ny , int i  )
+        {
+        idx_pr = treadIdx.x + blockIdx.x * blockDim.x ;
+        idx_pd = idx_pr + i* blockDim.x*gridDim.x ;
+
+        int xstart = point_info[i*4];
+        int ystart = point_info[i*4+2];
+        
+        unsigned int idx_o =  threadIdx.x + (blockIdx.x  + xstart )*o_ny + ystart ;
+        cuDoubleComplex p = prb[idx_pr] ;
+        double p2 = cuCabs(p) * cuCabs(p) ;
+
+        if( i ==0 ) {
+            obj[idx_o] = cuCmul(cuConj(p) , product[idx_pd] ) ;
+            norm[idx_o] = alpha + p2 ;
+        }  else {
+        obj[idx_o] = cuCadd(obj[idx_o] , cuCmul(cuConj(p) , product[idx_pd] ))
+        norm[idx_o] = norm[idx_o] + p2 ; 
+        }
+
+
+        }
+        }
     
-        }
-        }
 
 
         """, no_extern_c=1)
@@ -671,6 +699,7 @@ class ptycho_trans(object):
         self.kernel_dm_k5 = func_mod.get_function("dm_k5") 
         self.kernel_prob_trans = func_mod.get_function("prb_trans") 
         self.kernel_prob_reduce = func_mod.get_function("prb_reduce") 
+        self.kernel_obj_trans = func_mod.get_function("obj_trans"") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1528,6 +1557,38 @@ class ptycho_trans(object):
             obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min)
 
         self.obj = obj_update.copy()
+
+
+    def cal_object_trans_gpu(self):
+
+        points=self.num_points
+
+        for i in range(points) 
+            self.kernel_obj_trans( self.product_d, self.obj_d,  self.prb_d,  self.prb_norm_d , \
+                self.point_info_d , np.float64(self.alpha) ,  np.int32(self.ny_obj) , np.int32(i), \
+                block=(self.ny_prb,1,1), grid=(self.nx_prb,1,1) )
+
+        obj_update =self.obj_d.get()
+        norm_probe_array=self.prb_norm_d.get()
+
+        obj_update /= norm_probe_array
+        (index_x, index_y) = np.where(abs(obj_update) > self.amp_max)
+        if(np.size(index_x) > 0):
+            obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_max / np.abs(obj_update[index_x, index_y])
+        (index_x, index_y) = np.where(abs(obj_update) < self.amp_min)
+        if(np.size(index_x) > 0):
+            obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_min / np.abs(obj_update[index_x, index_y]+1.e-8)
+
+        (index_x, index_y) = np.where(np.angle(obj_update) > self.pha_max)
+        if(np.size(index_x) > 0):
+            obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_max)
+        (index_x, index_y) = np.where(np.angle(obj_update) < self.pha_min)
+        if(np.size(index_x) > 0):
+            obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min)
+
+        self.obj = obj_update.copy()
+
+        self.obj_d.set(self.obj)  
 
     def cal_mass_center(self, array):
         nx, ny = np.shape(array)
