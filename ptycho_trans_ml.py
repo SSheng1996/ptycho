@@ -273,7 +273,7 @@ class ptycho_trans(object):
         # complex temp buffs
         self.prb_obj_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb,self.ny_prb),dtype=np.complex128)       
         self.fft_tmp_d = gpuarray.empty_like(self.prb_obj_d)
-        self_prb_upd_d = gpuarray.empty_like(self.prb_d)
+        self.prb_upd_d = gpuarray.empty_like(self.prb_d)
 
         #  float temp buffs
         self.amp_tmp_d = gpuarray.empty((self.gpu_batch_size,self.nx_prb,self.ny_prb), dtype=np.float64)
@@ -565,7 +565,7 @@ class ptycho_trans(object):
         }
         
         extern "C" {
-        __global__ void prb_trans(cuDoubleComplex* product, cuDoubleComplex obj, cuDoubleComplex * p_upd, double * norm_upd,  cuDoubleComplex* prb, double * norm, int * points_info, 
+        __global__ void prb_trans(cuDoubleComplex* product, cuDoubleComplex* obj, cuDoubleComplex * p_upd, double * norm_upd,  cuDoubleComplex* prb, double * norm, int * point_info, 
         int size, int nx, int ny, int o_ny ,int offset  )
         {
         __shared__ cuDoubleComplex p[16][17] ;
@@ -580,32 +580,33 @@ class ptycho_trans(object):
         
         unsigned int idx_o =  y + (x  + xstart )*o_ny + ystart ;
         unsigned long int idx_product = idx_pr + (i+offset) * nx * ny ;
-        unsinged long idx_upd = idx_pr + blockIdx.y * nx * ny ;
+        unsigned long idx_upd = idx_pr + blockIdx.y * nx * ny ;
 
         
 
         if( i < size &&  idx_pr < nx*ny ) { 
         cuDoubleComplex o = obj[idx_o] ;
         n[threadIdx.x][threadIdx.y] = cuCabs(o) * cuCabs(o) ; 
-        p[threadIdx.x][trheadIdx.y] = cuCmul(product[idx_product], cuConj(o)  );
+        p[threadIdx.x][threadIdx.y] = cuCmul(product[idx_product], cuConj(o)  );
         } 
         else { 
-        p[threadIdx.x][trheadIdx.y] = cuCmplex(0.0, 0.0) ;
-        n[threadIdx.x][trheadIdx.y] =0.0 ;
+        p[threadIdx.x][threadIdx.y] = make_cuDoubleComplex(0.0, 0.0) ;
+        n[threadIdx.x][threadIdx.y] =0.0 ;
         }
-        __syncthread() ;
+        __syncthreads() ;
         
         for (unsigned int s=blockDim.y/2; s>1; s>>=1)
         {
             if (threadIdx.y  < s) {
             p[threadIdx.x][threadIdx.y] = cuCadd( p[threadIdx.x][threadIdx.y], p[threadIdx.x][threadIdx.y + s]) ;
-            n[threadIdx.x][threadIdx.y] += n[[threadIdx.x][threadIdx.y + s] ;  }
+            n[threadIdx.x][threadIdx.y] += n[threadIdx.x][threadIdx.y + s] ;  }
             __syncthreads();
         }
         if (threadIdx.y == 0 && idx_pr < nx*ny  && gridDim.y > 1 )  {
             p_upd[idx_upd] = cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) ; 
             norm_upd[idx_upd] = n[threadIdx.x][0] + n[threadIdx.x][1] ;
-        } else if (threadIdx.y == 0 && idx_pr < nx*ny ) {
+        } 
+        else if (threadIdx.y == 0 && idx_pr < nx*ny ) {
             prb[idx_pr] = cuCadd(prb[idx_pr],  cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] )) ; 
             norm[idx_pr] = norm[idx_pr] + n[threadIdx.x][0] + n[threadIdx.x][1] ;
         }    
@@ -614,38 +615,38 @@ class ptycho_trans(object):
         }
         
         extern "C" {
-        __global__ void prb_reduce(cuDoubleComplex* prb_upd, double * norm_upd,  cuDoubleComple* prb, double * norm,  int size, int prb_sz ,int offset  )
+        __global__ void prb_reduce(cuDoubleComplex* prb_upd, double * norm_upd,  cuDoubleComplex *  prb, double * norm,  int size, int prb_sz ,int offset  )
         {
         __shared__ cuDoubleComplex p[16][17]  ;
         __shared__ double n[16][17] ;
 
         unsigned int idx_pr = threadIdx.x + blockIdx.x* blockDim.x ;
         unsigned int i = threadIdx.y + blockIdx.y* blockDim.y ;
-        unsigned long  idx_upd = idx_pr + i * prb_sz 
+        unsigned long  idx_upd = idx_pr + i * prb_sz  ;
 
         if ( idx_pr < prb_sz ) {
-        p[threadIdx.x][trheadIdx.y] = prb_upd[idx_upd]  ;
-        n[threadIdx.x][trheadIdx.y] = norm_upd[idx_upd] ;
+        p[threadIdx.x][threadIdx.y] = prb_upd[idx_upd]  ;
+        n[threadIdx.x][threadIdx.y] = norm_upd[idx_upd] ;
         }
         else {
-        p[threadIdx.x][trheadIdx.y] = cuCmplex(0.0, 0.0) ;
-        n[threadIdx.x][trheadIdx.y] =0.0 ;
+        p[threadIdx.x][threadIdx.y] = make_cuDoubleComplex(0.0, 0.0) ;
+        n[threadIdx.x][threadIdx.y] =0.0 ;
         }
         
 
-        __syncthread() ;
+        __syncthreads() ;
 
         for (unsigned int s=blockDim.y/2; s>1; s>>=1)
         {
             if (threadIdx.y  < s) {
             p[threadIdx.x][threadIdx.y] = cuCadd( p[threadIdx.x][threadIdx.y], p[threadIdx.x][threadIdx.y + s]) ;
-            n[threadIdx.x][threadIdx.y] += n[[threadIdx.x][threadIdx.y + s] ;  }
+            n[threadIdx.x][threadIdx.y] += n[threadIdx.x][threadIdx.y + s] ;  }
             __syncthreads();
         }
         if (threadIdx.y == 0 && idx_pr < prb_sz  )  {
             if (offset != 0 ) {
-                prb[idx_prb] = cuCadd( prb[idx_prb], cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) );
-                norm[idx_prb] = norm[idx_prb] + n[threadIdx.x][0] + n[threadIdx.x][1] ;
+                prb[idx_pr] = cuCadd( prb[idx_pr], cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) );
+                norm[idx_pr] = norm[idx_pr] + n[threadIdx.x][0] + n[threadIdx.x][1] ;
                 } else {
                 prb[idx_pr] = cuCadd (p[threadIdx.x][0], p[threadIdx.x][1] ) ;
                 norm[idx_pr] = n[threadIdx.x][0] + n[threadIdx.x][1] ;
@@ -1643,19 +1644,19 @@ class ptycho_trans(object):
         nx = np.int32(self.nx_prb)
         ny = np.int32(self.ny_prb)
         o_ny = np.int32(self.ny_obj)
-
-        self.kernel_prob_trans( self.product_d, self.obj_d, \
-                self.obj_prb_d, self.dev_d, \
+        self.kernel_prob_trans( self.product_d,  self.obj_d, \
+                self.prb_obj_d, self.dev_d, \
                 self.prb_upd_d, self.obj_norm_d, \
-                self.point_info, \
-                np.int32(size), nx,ny,o_ny , offset, \
-                block=(tile_pb, tile_pt, 1 ) , grid = (grid_pb, grid_pt, 1) )
-
+                self.point_info_d, \
+                np.int32(size), nx, ny, o_ny , offset, \
+                block=(tile_pb, tile_pt, 1 ) , grid=(grid_pb, grid_pt, 1)  )
+        #self.kernel_prob_trans( self.product_d,  self.obj_d,  self.prb_obj_d, self.dev_d, self.prb_upd_d, self.obj_norm_d, self.point_info_d,  np.int32(size), nx, ny, o_ny , offset,  block=(16,16, 1 ) , grid=(grid_pb, grid_pt, 1)  )
+        #self.kernel_prob_trans( self.product_d,  self.obj_d,  self.prb_obj_d, self.dev_d, self.point_info_d,  np.int32(size), nx, ny, o_ny , offset,  block=(16,16, 1 ) , grid=(grid_pb, grid_pt, 1)  )
         
         #further reduce :
         #block_size = tile_pb * grid_pt
         if  grid_pt > 1  :
-            self.kernel_prob_reduce(self.obj_prb_d, self.dev_d , self.prb_upd_d, self.obj_norm_d, int32(grid_pt) , np.int32(prb_size), offset,\
+            self.kernel_prob_reduce(self.prb_obj_d, self.dev_d , self.prb_upd_d, self.obj_norm_d, np.int32(grid_pt) , np.int32(prb_size), offset,\
                 block=(tile_pb, grid_pt, 1) , grid=( grid_pb, 1,1 ) )
 
     def cal_probe_trans_gpu(self) :
