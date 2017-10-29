@@ -225,6 +225,7 @@ class ptycho_trans(object):
         self.diff_sum_sq_d = None
         self.prb_upd_d = None
         self.norm_obj_d = None
+        self.norm_prb_d = None
         self.kernel_chi_prb_obj = None 
         self.kernel_chi_sum_block = None 
         self.kernel_chi_reduce = None 
@@ -236,6 +237,7 @@ class ptycho_trans(object):
         self.kernel_prob_trans = None
         self.kernel_prob_reduce = None
         self.kernel_obj_trans = None
+        self.kernel_zero = None
         self.plan_f = None
         self.last = None
         self.plan_last = None
@@ -659,11 +661,11 @@ class ptycho_trans(object):
         }
         
         extern "C" {
-        __global__ void prb_trans(cuDoubleComplex* product, cuDoubleComplex* obj, cuDoubleComplex * prb,   double * norm, int * point_info, 
-         double alpha, int o_ny , int i  )
+        __global__ void obj_trans(cuDoubleComplex* product, cuDoubleComplex* obj, cuDoubleComplex * prb,   double * norm, int * point_info, 
+          int o_ny , int i  )
         {
-        idx_pr = treadIdx.x + blockIdx.x * blockDim.x ;
-        idx_pd = idx_pr + i* blockDim.x*gridDim.x ;
+        unsigned int idx_pr = threadIdx.x + blockIdx.x * blockDim.x ;
+        unsigned long idx_pd = idx_pr + i* blockDim.x*gridDim.x ;
 
         int xstart = point_info[i*4];
         int ystart = point_info[i*4+2];
@@ -672,17 +674,24 @@ class ptycho_trans(object):
         cuDoubleComplex p = prb[idx_pr] ;
         double p2 = cuCabs(p) * cuCabs(p) ;
 
-        if( i ==0 ) {
-            obj[idx_o] = cuCmul(cuConj(p) , product[idx_pd] ) ;
-            norm[idx_o] = alpha + p2 ;
-        }  else {
-        obj[idx_o] = cuCadd(obj[idx_o] , cuCmul(cuConj(p) , product[idx_pd] ))
+        obj[idx_o] = cuCadd(obj[idx_o] , cuCmul(cuConj(p) , product[idx_pd] )) ;
         norm[idx_o] = norm[idx_o] + p2 ; 
-        }
 
 
         }
         }
+        
+        extern "C" {
+        __global__ void zero(cuDoubleComplex* C,    double * D, double alpha, int  N ) 
+        {
+            unsigned long idx = threadIdx.x + blockIdx.x* blockDim.x ;
+            if (idx < N ) 
+            {
+                C[idx] = make_cuDoubleComplex(0.0,0.0 ) ;
+                D[idx] = alpha ;
+            }
+        }
+        } 
     
 
 
@@ -699,7 +708,8 @@ class ptycho_trans(object):
         self.kernel_dm_k5 = func_mod.get_function("dm_k5") 
         self.kernel_prob_trans = func_mod.get_function("prb_trans") 
         self.kernel_prob_reduce = func_mod.get_function("prb_reduce") 
-        self.kernel_obj_trans = func_mod.get_function("obj_trans"") 
+        self.kernel_obj_trans = func_mod.get_function("obj_trans") 
+        self.kernel_zero = func_mod.get_function("zero") 
 
     def use_pyfftw_fft(self):
         global ifftshift
@@ -1216,7 +1226,8 @@ class ptycho_trans(object):
             self.dm_gpu_single( n_batch * self.gpu_batch_size , self.last ) 
 
         # this is not needed when O,P update is calculated in GPU
-        self.product=self.product_d.get()
+        # self.product=self.product_d.get()
+	cuda.Context.synchronize()
 
     def recon_dm_trans_gpu_save(self):
 
@@ -1561,17 +1572,38 @@ class ptycho_trans(object):
 
     def cal_object_trans_gpu(self):
 
+        t0=time.time() 
         points=self.num_points
 
-        for i in range(points) 
+        # zero norm obj_update
+        self.kernel_zero(self.obj_d, self.prb_norm_d , np.float64(self.alpha), np.int32(self.nx_obj*self.ny_obj), \
+            block=(1024,1,1 ) ,\
+            grid=((self.nx_obj*self.ny_obj-1)/1024, 1 ,1 )) 
+
+	cuda.Context.synchronize()
+        t1=time.time() 
+        self.elaps[10] += t1-t0 
+        o_ny=np.int32(self.ny_obj)
+        
+
+        for i in range(points) : 
+            pt=np.int32(i) 
             self.kernel_obj_trans( self.product_d, self.obj_d,  self.prb_d,  self.prb_norm_d , \
-                self.point_info_d , np.float64(self.alpha) ,  np.int32(self.ny_obj) , np.int32(i), \
+                self.point_info_d ,   o_ny , pt, \
                 block=(self.ny_prb,1,1), grid=(self.nx_prb,1,1) )
+
+	cuda.Context.synchronize()
+        t0=time.time() 
+        self.elaps[11] += t0-t1
 
         obj_update =self.obj_d.get()
         norm_probe_array=self.prb_norm_d.get()
 
+	cuda.Context.synchronize()
         obj_update /= norm_probe_array
+        t1=time.time() 
+        self.elaps[12] += t1-t0
+
         (index_x, index_y) = np.where(abs(obj_update) > self.amp_max)
         if(np.size(index_x) > 0):
             obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_max / np.abs(obj_update[index_x, index_y])
@@ -1586,9 +1618,13 @@ class ptycho_trans(object):
         if(np.size(index_x) > 0):
             obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min)
 
+        t0=time.time() 
+        self.elaps[13] += t0-t1
         self.obj = obj_update.copy()
 
         self.obj_d.set(self.obj)  
+        t1=time.time() 
+        self.elaps[14] += t1-t0
 
     def cal_mass_center(self, array):
         nx, ny = np.shape(array)
@@ -1724,7 +1760,7 @@ class ptycho_trans(object):
 
 
         #load obj to GPU , only need before obj update is done in GPU
-        self.obj_d.set(self.obj) 
+        #self.obj_d.set(self.obj) 
 
         n_batch = self.num_points/self.gpu_batch_size 
         
@@ -2228,8 +2264,8 @@ class ptycho_trans(object):
         chi=0.0
         n_batch = self.num_points/self.gpu_batch_size
          
-        self.prb_d.set(self.prb)
-        self.obj_d.set(self.obj) 
+        #self.prb_d.set(self.prb)
+        #self.obj_d.set(self.obj) 
         #cuda.memcpy_htod(self.prb_d, self.prb )
         #cuda.memcpy_htod(self.obj_d, self.obj )
         for i in range(n_batch) :
@@ -2816,16 +2852,23 @@ class ptycho_trans(object):
             else:
                 if(it >= self.start_update_probe):
                     if(it >= self.start_update_object):
-                        self.cal_object_trans()
                         if(self.gpu_flag) :
+                            self.cal_object_trans_gpu()
                             self.cal_probe_trans_gpu() 
                         else :
+                            self.cal_object_trans()
                             self.cal_probe_trans()
                     else:
-                        self.cal_probe_trans()
+                        if(self.gpu_flag) :
+                            self.cal_probe_trans_gpu()
+                        else :
+                            self.cal_probe_trans()
                 else:
                     if(it >= self.start_update_object):
-                        self.cal_object_trans()
+                        if(self.gpu_flag) :
+                            self.cal_object_trans_gpu()
+                        else :
+                            self.cal_object_trans()
 
             if(self.position_correction_flag):
                 if(it >= np.floor(self.position_correction_start) and np.mod(it, self.position_correction_step) == 0):
