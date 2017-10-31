@@ -172,7 +172,7 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
     recon.processes = 0
     recon.gpu_flag = gpu_flag
     recon.recon_ptycho()
-    recon.save_recon()
+    #recon.save_recon()
     #recon.display_recon()
 
 if __name__ == '__main__':

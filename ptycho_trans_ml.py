@@ -1416,7 +1416,7 @@ class ptycho_trans(object):
         # zero norm obj_update
         self.kernel_zero(self.obj_d, self.prb_norm_d , np.float64(self.alpha), np.int32(self.nx_obj*self.ny_obj), \
             block=(1024,1,1 ) ,\
-            grid=((self.nx_obj*self.ny_obj-1)/1024, 1 ,1 )) 
+            grid=((self.nx_obj*self.ny_obj-1)/1024+1 , 1 ,1 )) 
 
 	cuda.Context.synchronize()
         t1=time.time() 
