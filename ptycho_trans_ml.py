@@ -209,7 +209,7 @@ class ptycho_trans(object):
 
         #GPU
         self.gpu_flag = False
-	self.prb_d = None
+        self.prb_d = None
         self.points_info_d = None
         self.obj_d = None
         self.product_d = None
@@ -268,7 +268,7 @@ class ptycho_trans(object):
         #self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
         self.diff_d = gpuarray.to_gpu(self.diff_array)
 
-        print "product type ", type(self.product) , np.shape(self.product)
+        #print "product type ", type(self.product) , np.shape(self.product)
         product=np.array(self.product)
         self.product_d = gpuarray.to_gpu(product)
 
@@ -1206,7 +1206,7 @@ class ptycho_trans(object):
         scale = np.float64(np.sqrt(self.nx_prb * self.ny_prb)) 
         n = np.int32(size * self.nx_prb * self.ny_prb)
         block_size =128
-        n_blocks = (n -1 )/block_size +1 
+        n_blocks = (size*self.nx_prb * self.ny_prb -1 )//block_size +1 
         self.kernel_dm_k5(self.fft_tmp_d, self.product_d, self.prb_obj_d,  \
                 n, beta, scale, nx, ny, offset ,\
                 block=( block_size, 1,1) , grid=(n_blocks, 1,1 ) )
@@ -1217,7 +1217,8 @@ class ptycho_trans(object):
         #cuda.memcpy_htod(self.prb_d, self.prb )
         #cuda.memcpy_htod(self.obj_d, self.obj )
 
-        n_batch = self.num_points/self.gpu_batch_size
+        n_batch = self.num_points//self.gpu_batch_size
+        #print(n_batch, self.num_points, self.gpu_batch_size)
         for i in range(n_batch) :
             self.dm_gpu_single( i * self.gpu_batch_size, self.gpu_batch_size)
 
@@ -1227,7 +1228,7 @@ class ptycho_trans(object):
 
         # this is not needed when O,P update is calculated in GPU
         # self.product=self.product_d.get()
-	cuda.Context.synchronize()
+        cuda.Context.synchronize()
         
 
 
@@ -1416,9 +1417,9 @@ class ptycho_trans(object):
         # zero norm obj_update
         self.kernel_zero(self.obj_d, self.prb_norm_d , np.float64(self.alpha), np.int32(self.nx_obj*self.ny_obj), \
             block=(1024,1,1 ) ,\
-            grid=((self.nx_obj*self.ny_obj-1)/1024+1 , 1 ,1 )) 
+            grid=((self.nx_obj*self.ny_obj-1)//1024+1 , 1 ,1 )) 
 
-	cuda.Context.synchronize()
+        cuda.Context.synchronize()
         t1=time.time() 
         self.elaps[10] += t1-t0 
         o_ny=np.int32(self.ny_obj)
@@ -1430,14 +1431,14 @@ class ptycho_trans(object):
                 self.point_info_d ,   o_ny , pt, \
                 block=(self.ny_prb,1,1), grid=(self.nx_prb,1,1) )
 
-	cuda.Context.synchronize()
+        cuda.Context.synchronize()
         t0=time.time() 
         self.elaps[11] += t0-t1
 
         obj_update =self.obj_d.get()
         norm_probe_array=self.prb_norm_d.get()
 
-	cuda.Context.synchronize()
+        cuda.Context.synchronize()
         obj_update /= norm_probe_array
         t1=time.time() 
         self.elaps[12] += t1-t0
@@ -1571,8 +1572,8 @@ class ptycho_trans(object):
         prb_size = self.nx_prb *self.ny_prb
         offset = np.int32(start_point)
 
-        grid_pb = (prb_size-1)/tile_pb +1
-        grid_pt = (size-1)/tile_pt +1 
+        grid_pb = (prb_size-1)//tile_pb +1
+        grid_pt = (size-1)//tile_pt +1 
 
         #block_size = tile_pb * tile_pt
         #nblocks = grid_pb * grid_pt  
@@ -1600,7 +1601,7 @@ class ptycho_trans(object):
         #load obj to GPU , only need before obj update is done in GPU
         #self.obj_d.set(self.obj) 
 
-        n_batch = self.num_points/self.gpu_batch_size 
+        n_batch = self.num_points//self.gpu_batch_size 
         
         for i in range(n_batch) :
             self.cal_probe_trans_gpu_single( i*self.gpu_batch_size, self.gpu_batch_size)
@@ -2079,9 +2080,9 @@ class ptycho_trans(object):
         offset = np.int32(start_point) 
         block_size = self.ny_prb
         n_blocks = size *self.nx_prb
-	nx = np.int32(self.nx_prb)
-	ny = np.int32(self.ny_prb)
-	o_ny = np.int32(self.ny_obj)
+        nx = np.int32(self.nx_prb)
+        ny = np.int32(self.ny_prb)
+        o_ny = np.int32(self.ny_obj)
         self.kernel_chi_prb_obj(self.prb_d, self.obj_d, self.fft_tmp_d, self.point_info_d, \
 		nx, ny, o_ny, offset, \
                 block=(block_size,1,1), grid=(n_blocks,1,1) )
@@ -2100,7 +2101,7 @@ class ptycho_trans(object):
 
     def cal_chi_error_gpu(self, it) :
         chi=0.0
-        n_batch = self.num_points/self.gpu_batch_size
+        n_batch = self.num_points//self.gpu_batch_size
          
         #self.prb_d.set(self.prb)
         #self.obj_d.set(self.obj) 
