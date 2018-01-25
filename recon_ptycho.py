@@ -11,6 +11,7 @@ import rot
 import prop_class as pc
 import simulate_zp as szp
 import h5py
+from mpi4py import MPI
 
 def congrid_fft(array_in, shape):
     x_in, y_in = np.shape(array_in)
@@ -28,29 +29,95 @@ def congrid_fft(array_in, shape):
 
 def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
 
+    print('enter recon')
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    lrank=int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+    lsize=int(os.environ['OMPI_COMM_WORLD_LOCAL_SIZE'])
+    print 'my rank is: {} ,local rank is {},local_size {} , Total rank is : {}'.format( rank ,lrank, lsize, size )
+    
+
     mode_flag = 0
     mesh_flag = 1
     distance = 0
-    f = h5py.File('scan_'+scan_num+'.h5','r')
-    diffamp = np.array(f['diffamp'])         # scan data
-    points = np.array(f['points'])
-    x_range = np.array(f['x_range'])
-    y_range = np.array(f['y_range'])
-    dr_x = np.array(f['dr_x'])
-    dr_y = np.array(f['dr_y'])
-    z_m = np.array(f['z_m'])
-    lambda_nm = np.array(f['lambda_nm'])
-    f.close()
+    x_range=np.int64(0)
+    y_range=np.int64(0)
+    dr_x=np.float64(0.0)
+    dr_y=np.float64(0.0)
+    z_m=np.float64(0.0)
+    lambda_nm=np.float64(0.0)
+    nz=0
+    list=None
+    
+    
+    
+    if rank == 0 :
+       f = h5py.File('scan_'+scan_num+'.h5','r')
+       diffamp = np.array(f['diffamp'])         # scan data
+       points = np.array(f['points'])
+       x_range = np.array(f['x_range'])
+       y_range = np.array(f['y_range'])
+       dr_x = np.array(f['dr_x'])
+       dr_y = np.array(f['dr_y'])
+       z_m = np.array(f['z_m'])
+       lambda_nm = np.array(f['lambda_nm'])
+       f.close()
 
-    nz, nx , ny =np.shape(diffamp)
+       nz, nx , ny =np.shape(diffamp)
+       print "shape of diffamp: ", np.shape(diffamp)
+       
+       diff_all=np.array_split(diffamp, size)
+       list=[] 
+       for i in range(size):
+            list.append(np.shape(diff_all[i]))
+
+    
+    list=comm.bcast(list, root=0 )
+    nz=comm.bcast(nz,root=0)
+    x_range=comm.bcast(x_range,root=0)
+    y_range=comm.bcast(y_range,root=0)
+    dr_x=comm.bcast(dr_x,root=0)
+    dr_y=comm.bcast(dr_y,root=0)
+    z_m=comm.bcast(z_m,root=0)
+    lambda_nm=comm.bcast(lambda_nm,root=0)
 
 
+    if rank == 0 :
+
+       diff_l=diff_all[0] 
+       for i in range(1, size) :
+            comm.Send(diff_all[i], dest=i , tag=i+70 ) 
+
+    else : 
+       diff_l = np.empty(list[rank], dtype=np.float64)
+       comm.Recv(diff_l, source = 0, tag = rank+70 ) 
+    nz_l, nx , ny =np.shape(diff_l)
+    print "shape of diff_l: ",rank, np.shape(diff_l)
+    print rank , x_range, y_range , dr_x, dr_y , z_m, lambda_nm,nz_l        
+
+
+
+ 
     kernal_n = 32
-    recon = ptycho_trans(diffamp)  
+    if rank == 0:
+        recon = ptycho_trans(diffamp)  
+    else:
+        recon = ptycho_trans(diff_l)
+    recon.comm = comm
+    recon.size = size
+    recon.rank = rank
+    recon.lrank = lrank
+    recon.lsize = lsize
+    recon.ptdist = list
+    recon.diff_l = diff_l
+
     recon.file_num = nz            
     recon.nx_prb = nx              
     recon.ny_prb = ny              
     recon.num_points = nz 
+    recon.num_points_l = nz_l
 
     recon.start_ave = 0.8
     recon.scan_num = scan_num  #scan number
@@ -77,8 +144,9 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
     recon.ccd_pixel_um = 55.      #detector pixel size (um)
 
     # scan direction and geometry correction handling
-    recon.points = -1*points
-    recon.points[0,:] *=-1 * np.abs(np.cos(15.*np.pi/180.))
+    if rank ==0 :
+        recon.points = -1*points
+        recon.points[0,:] *=-1 * np.abs(np.cos(15.*np.pi/180.))
 
     # recon pixel size
     pixel_size_m = recon.lambda_nm * recon.z_m * 1e-3 / (recon.x_roi * recon.ccd_pixel_um)
@@ -139,28 +207,29 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
     #recon.prb_center_flag = True
     recon.init_prb_flag = False             #True to start with a random guess. False to load a pre-existing array
     recon.mask_prb_flag = False
-    if p_flag:
-        prb = np.load('./recon_result/S'+scan_num+'/t1/recon_data/recon_'+scan_num+'_t1_probe_ave_rp.npy')
-    else:
-        #s = diffamp[0,:,:]
-        #tmp = np.fft.fftshift(np.fft.fftn(s)) / np.sqrt(np.size(s))
-        tmp = np.load('recon_probe.npy')
-        prb = tmp
+    if rank == 0 :
+        if p_flag:
+            prb = np.load('./recon_result/S'+scan_num+'/t1/recon_data/recon_'+scan_num+'_t1_probe_ave_rp.npy')
+        else:
+            #s = diffamp[0,:,:]
+            #tmp = np.fft.fftshift(np.fft.fftn(s)) / np.sqrt(np.size(s))
+            tmp = np.load('recon_probe.npy')
+            prb = tmp
 
-    if prb.shape != (nx, ny):
-        print('Resizing loaded probe from %s to %s' % (prb.shape, (nx, ny)))
-        prb = congrid_fft(prb,(nx,ny))
+        if prb.shape != (nx, ny):
+            print('Resizing loaded probe from %s to %s' % (prb.shape, (nx, ny)))
+            prb = congrid_fft(prb,(nx,ny))
 
-    if not mode_flag:
-        recon.prb = prb
-    else:
-        recon.start_update_probe = 0
-        recon.prb_mode =  np.zeros((recon.nx_prb, recon.ny_prb, recon.prb_mode_num)).astype(complex)
-        recon.prb_mode[:,:,0] = prb
-        recon.prb_mode[:,:,1] = shift_sum(prb,20) / 40.
-        recon.prb_mode[:,:,2] = shift_sum(prb,16) / 32.
-        recon.prb_mode[:,:,3] = shift_sum(prb,10) / 20.
-        recon.prb_mode[:,:,4] = shift_sum(prb,6) / 12.
+        if not mode_flag:
+            recon.prb = prb
+        else:
+            recon.start_update_probe = 0
+            recon.prb_mode =  np.zeros((recon.nx_prb, recon.ny_prb, recon.prb_mode_num)).astype(complex)
+            recon.prb_mode[:,:,0] = prb
+            recon.prb_mode[:,:,1] = shift_sum(prb,20) / 40.
+            recon.prb_mode[:,:,2] = shift_sum(prb,16) / 32.
+            recon.prb_mode[:,:,3] = shift_sum(prb,10) / 20.
+            recon.prb_mode[:,:,4] = shift_sum(prb,6) / 12.
 
     recon.sf_flag = False
 
@@ -171,9 +240,13 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
 
     recon.processes = 0
     recon.gpu_flag = gpu_flag
-    recon.recon_ptycho()
-    #recon.save_recon()
-    #recon.display_recon()
+    if rank == 0 :
+        recon.recon_ptycho()
+    #if rank == 0 : 
+        #recon.save_recon()
+        #recon.display_recon()
+
+
 
 if __name__ == '__main__':
     scan_num,sign = sys.argv[1:3]

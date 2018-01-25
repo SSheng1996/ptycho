@@ -26,12 +26,14 @@ from cal_stxm_dpc import cal_stxm_dpc
 
 
 ## For GPU 
-import pycuda.autoinit
+##import pycuda.autoinit not need for mpi
 import pycuda.driver as cuda
 from  pycuda.compiler import SourceModule
 from pycuda import gpuarray, compiler, tools 
 import skcuda.fft as cu_fft
 
+### For MPI
+import mpi4py as MPI
 
 
 if 'PROFILE' not in os.environ:
@@ -49,12 +51,6 @@ def parallel_function(fcn_name, *args, **kwargs):
         print('Parallel execution of `%s` failed: (%s) %s' % (fcn_name, ex.__class__.__name__, ex))
         traceback.print_exc()
 
-def LargestPowerOf2(number) :
-    res = 1
-    while res <=  number :
-        res *= 2 
-    return res/2
-
 
 class ptycho_trans(object):
     def __init__(self, diffamp):
@@ -63,6 +59,17 @@ class ptycho_trans(object):
         self.verbose = True
 
         # public attributes
+        self.comm =None
+        self.size =None
+        self.rank = None  ## MPI rank
+        self.lrank = None  ## node local MPI rank , will be used for GPU device number
+        self.lsize = None  ## node local MPI size
+        self.num_point_l =None  ##Number of points for rank local
+        self.diff_l = None     ## ##diffraction data rank local
+        self.product_l = None   ## rank local product array 
+        self.point_info_l = None  ## rank local point_info
+        self.ptdist = None  ## point distribution over ranks
+
         self.diff_array = diffamp  ##diffraction data
         self.nx_prb = None  ##number of pixels per side of array
         self.ny_prb = None  ##number of pixels per side of array
@@ -214,6 +221,11 @@ class ptycho_trans(object):
         self.error_obj_ms = None
 
         #GPU
+        self.gpu_number = 0
+        self.dev = None
+        self.ctx = None
+
+        
         self.gpu_flag = False
         self.prb_d = None
         self.points_info_d = None
@@ -261,22 +273,31 @@ class ptycho_trans(object):
             self.use_numpy_fft()
 
     def gpu_init(self):
+        cuda.init()
+        num = cuda.Device.count()
+        if num < self.lsize  :
+           print "Not enough gpu"
+           self.comm.Abort()  
+        self.gpu_number = self.lrank
+        self.dev=cuda.Device(self.gpu_number)
+        self.ctx = self.dev.make_context()
 
-        self.last = self.num_points % self.gpu_batch_size
+        self.last = self.num_points_l % self.gpu_batch_size
 
         # Load arrays to GPU.
-        self.diff_sum_sq = np.sum(self.diff_array**2, axis=(1,2))
+        self.diff_sum_sq = np.sum(self.diff_l**2, axis=(1,2))
         self.diff_sum_sq_d = gpuarray.to_gpu(self.diff_sum_sq)
-        self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info))
+        self.point_info_d  = gpuarray.to_gpu(np.int32(self.point_info_l))
         self.prb_d = gpuarray.to_gpu(self.prb) 
         self.obj_d = gpuarray.to_gpu(self.obj) 
         #self.prb_d = cuda.mem_alloc(self.prb.size * self.prb.dtype.itemsize)
         #self.obj_d = cuda.mem_alloc(self.obj.size * self.obj.dtype.itemsize)
-        self.diff_d = gpuarray.to_gpu(self.diff_array)
+        self.diff_d = gpuarray.to_gpu(self.diff_l)
 
         #print "product type ", type(self.product) , np.shape(self.product)
-        product=np.array(self.product)
-        self.product_d = gpuarray.to_gpu(product)
+        #product=np.array(self.product_l)
+        #self.product_d = gpuarray.to_gpu(product)
+        self.product_d = gpuarray.to_gpu(self.product_l)
 
 
         # complex temp buffs
@@ -295,9 +316,8 @@ class ptycho_trans(object):
         # make plan for cufft
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.gpu_batch_size)
         # last flan have different number of points.
-        if self.last > 0 :
+        if self.last > 0 : 
             self.plan_last = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.last)
-
 
 
 
@@ -333,7 +353,7 @@ class ptycho_trans(object):
 
 
         extern "C" {
-        __global__ void chi_sum_block( cuDoubleComplex * prb_obj, double * diff, double* diff_sum_sq , double* buff, int scale, int offset, int B  )
+        __global__ void chi_sum_block( cuDoubleComplex * prb_obj, double * diff, double* diff_sum_sq , double* buff, int scale, int offset  )
         {
         extern  __shared__ double sdata[];
 
@@ -352,14 +372,12 @@ class ptycho_trans(object):
         if (norm > 0.0) sdata[tid] = chi/norm ;
         __syncthreads() ;
 
-        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
-        for (unsigned int s=B/2; s>1; s>>=1)
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
         {
             if (tid < s) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
-        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -374,9 +392,8 @@ class ptycho_trans(object):
             __syncthreads() ;
         sdata[tid] += sdata[tid + 1];
         }
-        */
 
-        if(tid ==0 ) buff[blockIdx.x]=sdata[0] + sdata[1] ; 
+        if(tid ==0 ) buff[blockIdx.x]=sdata[0] ; 
         //if(tid ==0 && blockIdx.x < 16) printf("buff[%d]=%f , %d \\n",blockIdx.x,sdata[0], point ) ;
 
         
@@ -448,14 +465,14 @@ class ptycho_trans(object):
 
 
         extern "C" {
-        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_d, double* dev_tmp , int  nx , double sigma1, int offset, int B )
+        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_d, double* dev_tmp , int  nx , double sigma1, int offset )
         {
         extern __shared__ double sdata[] ; 
         
         unsigned int tid = threadIdx.x ;
         unsigned long idx=tid+blockDim.x*blockIdx.x ;
         unsigned long idx_diff = idx + offset * blockDim.x * nx ;
-        //unsigned int i = blockIdx.x /nx ;
+        unsigned int i = blockIdx.x /nx ;
         double scale =  double(nx*blockDim.x) ;
         double scale_sqrt = sqrt(scale) ;
         cuDoubleComplex  fft = cuCmul(fft_tmp[idx], make_cuDoubleComplex(1.0/scale_sqrt,0.0))  ;
@@ -471,18 +488,12 @@ class ptycho_trans(object):
         sdata[tid] = dev * dev ;
         __syncthreads();
 
-        // first sum  only  Dim-B threads sum
-        // B is largest 2^power which is < block size 
-        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
-
-        //now just reduce first B items of sdata  
-        for (unsigned int s=B/2; s>1; s>>=1)
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
         {
-            if (tid < s ) {
+            if (tid < s) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
-        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -496,7 +507,6 @@ class ptycho_trans(object):
         sdata[tid] += sdata[tid + 2];
             __syncthreads() ;
         }
-        */
 
         if ( tid == 0 ) 
         dev_tmp[blockIdx.x] = (sdata[0]+sdata[1])/scale ;
@@ -510,7 +520,7 @@ class ptycho_trans(object):
         }
 
         extern "C" {
-        __global__ void dm_reduce_dev(double* dev_tmp,  double * power, int B   )
+        __global__ void dm_reduce_dev(double* dev_tmp,  double * power   )
         {
         extern __shared__ double sdata[] ; 
 
@@ -520,14 +530,12 @@ class ptycho_trans(object):
         sdata[tid] = dev_tmp[idx];
         __syncthreads();
 
-        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
-        for (unsigned int s=B/2; s>1; s>>=1)
+        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
         {
             if (tid < s) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
-        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -541,7 +549,6 @@ class ptycho_trans(object):
         sdata[tid] += sdata[tid + 2];
             __syncthreads() ;
         }
-        */
 
         if ( tid == 0 ) 
         power[blockIdx.x] =sdata[0] + sdata[1] ;
@@ -717,8 +724,10 @@ class ptycho_trans(object):
 
         """, no_extern_c=1)
 
+
         self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
         self.kernel_chi_sum_block = func_mod.get_function("chi_sum_block") 
+        self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_dm_prb_obj = func_mod.get_function("dm_prb_obj") 
         self.kernel_dm_cal_dev = func_mod.get_function("dm_cal_dev") 
@@ -1200,24 +1209,22 @@ class ptycho_trans(object):
         block_size = self.ny_prb 
         n_blocks = size * self.nx_prb 
         sigma1 = np.float64(self.sigma1) 
-        B=np.int32(LargestPowerOf2(block_size))
         self.kernel_dm_cal_dev(self.fft_tmp_d, self.amp_tmp_d, self.diff_d, self.dev_d,  self.dev_buff_d, nx ,  \
-                sigma1, offset, B ,\
+                sigma1, offset, \
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.ny_prb* 8 ) 
 		
         # cpu calculate power or futher gpu reduce if points are a lot .
         block_size = self.nx_prb
         n_blocks = size
-        self.kernel_dm_reduce_dev(self.dev_buff_d, self.power_d , B, \
+        self.kernel_dm_reduce_dev(self.dev_buff_d, self.power_d ,
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.nx_prb* 8 ) 
         
         # calculate diff+dev*sqrt(sigma2/power) 
         block_size = self.ny_prb
         n_blocks = size*self.nx_prb
         sigma2=np.float64(self.sigma2)
-        self.kernel_dm_k4(self.diff_d, self.dev_d, self.power_d, self.amp_tmp_d , self.fft_tmp_d, sigma2, nx, offset,  \
+        self.kernel_dm_k4(self.diff_d, self.dev_d, self.power_d, self.amp_tmp_d , self.fft_tmp_d, sigma2, nx, offset, \
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) )
-
 
         # inverse fft
         cu_fft.ifft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f, True )
@@ -1238,10 +1245,10 @@ class ptycho_trans(object):
         #cuda.memcpy_htod(self.prb_d, self.prb )
         #cuda.memcpy_htod(self.obj_d, self.obj )
 
-        n_batch = self.num_points//self.gpu_batch_size
+        #n_batch = self.num_points//self.gpu_batch_size
+        n_batch = self.num_points_l//self.gpu_batch_size
         #print(n_batch, self.num_points, self.gpu_batch_size)
         for i in range(n_batch) :
-            ##print " batch number :" , i, "total points: ", self.num_points 
             self.dm_gpu_single( i * self.gpu_batch_size, self.gpu_batch_size)
 
         #lasr batch have different size :
@@ -1434,7 +1441,8 @@ class ptycho_trans(object):
     def cal_object_trans_gpu(self):
 
         t0=time.time() 
-        points=self.num_points
+        #points=self.num_points
+        points=self.num_points_l
 
         # zero norm obj_update
         self.kernel_zero(self.obj_d, self.prb_norm_d , np.float64(self.alpha), np.int32(self.nx_obj*self.ny_obj), \
@@ -1457,32 +1465,39 @@ class ptycho_trans(object):
         t0=time.time() 
         self.elaps[11] += t0-t1
 
-        obj_update =self.obj_d.get()
-        norm_probe_array=self.prb_norm_d.get()
+        obj_update_l =self.obj_d.get()
+        norm_probe_array_l =self.prb_norm_d.get()
+        
+        object_update = self.comm.reduce(obj_update_l,op=MPI.SUM)
+        norm_probe_array = self.comm.reduce(norm_probe_array_l,op=MPI.SUM)
 
         cuda.Context.synchronize()
-        obj_update /= norm_probe_array
-        t1=time.time() 
-        self.elaps[12] += t1-t0
 
-        (index_x, index_y) = np.where(abs(obj_update) > self.amp_max)
-        if(np.size(index_x) > 0):
-            obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_max / np.abs(obj_update[index_x, index_y])
-        (index_x, index_y) = np.where(abs(obj_update) < self.amp_min)
-        if(np.size(index_x) > 0):
-            obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_min / np.abs(obj_update[index_x, index_y]+1.e-8)
+        if self.rank == 0 :
+            obj_update /= norm_probe_array
+            t1=time.time() 
+            self.elaps[12] += t1-t0
 
-        (index_x, index_y) = np.where(np.angle(obj_update) > self.pha_max)
-        if(np.size(index_x) > 0):
-            obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_max)
-        (index_x, index_y) = np.where(np.angle(obj_update) < self.pha_min)
-        if(np.size(index_x) > 0):
-            obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min)
+            (index_x, index_y) = np.where(abs(obj_update) > self.amp_max)
+            if(np.size(index_x) > 0):
+                obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_max / np.abs(obj_update[index_x, index_y])
+            (index_x, index_y) = np.where(abs(obj_update) < self.amp_min)
+            if(np.size(index_x) > 0):
+                obj_update[index_x, index_y] = obj_update[index_x, index_y] * self.amp_min / np.abs(obj_update[index_x, index_y]+1.e-8)
 
-        t0=time.time() 
-        self.elaps[13] += t0-t1
-        self.obj = obj_update.copy()
+            (index_x, index_y) = np.where(np.angle(obj_update) > self.pha_max)
+            if(np.size(index_x) > 0):
+                obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_max)
+            (index_x, index_y) = np.where(np.angle(obj_update) < self.pha_min)
+            if(np.size(index_x) > 0):
+                obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min)
 
+            t0=time.time() 
+            self.elaps[13] += t0-t1
+
+            self.obj = obj_update.copy()
+
+        self.obj = self.comm.bcast(self.obj, root=0 ) 
         self.obj_d.set(self.obj)  
         t1=time.time() 
         self.elaps[14] += t1-t0
@@ -1623,7 +1638,7 @@ class ptycho_trans(object):
         #load obj to GPU , only need before obj update is done in GPU
         #self.obj_d.set(self.obj) 
 
-        n_batch = self.num_points//self.gpu_batch_size 
+        n_batch = self.num_points_l//self.gpu_batch_size 
         
         for i in range(n_batch) :
             self.cal_probe_trans_gpu_single( i*self.gpu_batch_size, self.gpu_batch_size)
@@ -1633,10 +1648,18 @@ class ptycho_trans(object):
 
 
         # read the prob_update and normal_obj out
-        norm=self.obj_norm_d.get()
-        prb=self.prb_upd_d.get() 
-        #update prb
-        self.prb = prb/norm
+        norm_l=self.obj_norm_d.get()
+        prb_l=self.prb_upd_d.get() 
+
+        ### Collect rsults from other MPI ranks and sum over 
+        norm = self.comm.reduce(norm_l , op=MPI.SUM ) 
+        prb = self.comm.reduce(prb_l , op=MPI.SUM )
+
+        if self.rank == 0 :
+            #update prb
+            self.prb = prb/norm
+
+        self.prb = self.comm.bcast( self.prb , root=0 ) 
         # load back prb to GPU , this is necessary for multi GPU implementation later on
         self.prb_d.set(self.prb)
         # 
@@ -2116,15 +2139,14 @@ class ptycho_trans(object):
         chi_tmp=np.zeros((nblocks,),dtype=np.float64) 
         buff =gpuarray.empty(np.shape(chi_tmp),dtype=np.float64)
         scale = np.int32(self.nx_prb*self.ny_prb )
-        B=np.int32(LargestPowerOf2(block_size))
         self.kernel_chi_sum_block(self.fft_tmp_d, self.diff_d, self.diff_sum_sq_d, buff, \
-                 scale, offset, B,  block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
+                 scale, offset, block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
         chi_tmp = buff.get() 
         return np.sum(chi_tmp) 
 
     def cal_chi_error_gpu(self, it) :
         chi=0.0
-        n_batch = self.num_points//self.gpu_batch_size
+        n_batch = self.num_points_l//self.gpu_batch_size
          
         #self.prb_d.set(self.prb)
         #self.obj_d.set(self.obj) 
@@ -2134,7 +2156,9 @@ class ptycho_trans(object):
             chi += self.chi_gpu_single( i*self.gpu_batch_size , self.gpu_batch_size ) 
         if  self.last > 0 :
             chi += self.chi_gpu_single( n_batch*self.gpu_batch_size, self.last ) 
-        self.error_chi[it] = np.sqrt(chi/self.num_points)
+
+        chi_t = self.comm.reduce(chi, op=MPI.SUM) 
+        self.error_chi[it] = np.sqrt(chi_t/self.num_points)
     
         
 
@@ -2455,50 +2479,66 @@ class ptycho_trans(object):
     # ptycho reconstruction
     @profile
     def recon_ptycho(self):
+        if self.rank == 0 :
+            self.x_pixel_m = self.lambda_nm * self.z_m * 1.e-3 / (self.x_roi * self.ccd_pixel_um)
+            self.y_pixel_m = self.lambda_nm * self.z_m * 1.e-3 / (self.y_roi * self.ccd_pixel_um)
+            print(self.x_pixel_m, self.y_pixel_m)
 
-        self.x_pixel_m = self.lambda_nm * self.z_m * 1.e-3 / (self.x_roi * self.ccd_pixel_um)
-        self.y_pixel_m = self.lambda_nm * self.z_m * 1.e-3 / (self.y_roi * self.ccd_pixel_um)
-        print(self.x_pixel_m, self.y_pixel_m)
-
-        if self.cal_scan_pattern_flag:
-            if self.mesh_flag:
-                self.cal_scan_pattern_mesh()
-            elif self.fermat_flag:
-                self.cal_scan_pattern_fermat()
+            if self.cal_scan_pattern_flag:
+                if self.mesh_flag:
+                    self.cal_scan_pattern_mesh()
+                elif self.fermat_flag:
+                    self.cal_scan_pattern_fermat()
+                else:
+                    self.cal_scan_pattern()
             else:
-                self.cal_scan_pattern()
-        else:
-            if self.bragg_flag:
-                self.convert_scan_pattern()
-            self.points[0,:] = np.round(self.points[0,:]*1.e-6/self.x_pixel_m)
-            self.points[1,:] = np.round(self.points[1,:]*1.e-6/self.y_pixel_m)
-            self.points[0,:] = self.points[0,:] - np.min(self.points[0,:]) + self.nx_prb / 2 + 15
-            self.points[1,:] = self.points[1,:] - np.min(self.points[1,:]) + self.ny_prb / 2 + 15
+                if self.bragg_flag:
+                    self.convert_scan_pattern()
+                self.points[0,:] = np.round(self.points[0,:]*1.e-6/self.x_pixel_m)
+                self.points[1,:] = np.round(self.points[1,:]*1.e-6/self.y_pixel_m)
+                self.points[0,:] = self.points[0,:] - np.min(self.points[0,:]) + self.nx_prb / 2 + 15
+                self.points[1,:] = self.points[1,:] - np.min(self.points[1,:]) + self.ny_prb / 2 + 15
 
-        np.save('points_test', self.points)
-        self.cal_obj_prb_dim()
-        if(self.init_prb_flag):
-            self.init_prb()
-        if(self.init_obj_flag):
-            if self.init_obj_dpc_flag:
-                self.init_obj_stxm_dpc()
-            else:
-                self.init_obj()
+            np.save('points_test', self.points)
+            self.cal_obj_prb_dim()
+            if(self.init_prb_flag):
+                self.init_prb()
+            if(self.init_obj_flag):
+                if self.init_obj_dpc_flag:
+                    self.init_obj_stxm_dpc()
+                else:
+                    self.init_obj()
 
-        self.init_product()
+            self.init_product()
+            print "after init_product"
 
-        if self.pc_flag:
-            if self.init_coh_flag:
-                self.init_coh()
-            if self.init_pc_filter_flag:
-                self.init_pc_filter()
-        '''
-        if self.online_flag:
-            file_num = self.check_file_num()
-            while file_num < 10:
+            if self.pc_flag:
+                if self.init_coh_flag:
+                    self.init_coh()
+                if self.init_pc_filter_flag:
+                    self.init_pc_filter()
+            '''
+            if self.online_flag:
                 file_num = self.check_file_num()
-                time.sleep(5)
-        '''
+                while file_num < 10:
+                    file_num = self.check_file_num()
+                    time.sleep(5)
+            '''
+
+        self.prb = self.comm.bcast(self.prb , root = 0 ) 
+        self.obj = self.comm.bcast(self.obj , root = 0 ) 
+
+        if self.rank ==0 :
+            product_a = np.array_split(np.array(self.product), self.size )
+            self.product_l = product_a[0] 
+            for i in range ( 1, self.size) :
+                self.comm.Send(product_a[i], dest=i , tag=700+i ) 
+        else :
+            self.product_l = np.empty(self.ptdist[i], dtype=np.complex128)
+            self.comm.Recv(self.product_l, source =0 , tag= self.rank+700 )
+
+        self.point_info = self.comm.bcast( self.point_info, root=0 ) 
+        self.point_info_l = np.array_split(self.point_info, self.size ) [self.rank]
 
         if self.gpu_flag:
             self.gpu_init()
@@ -2675,201 +2715,206 @@ class ptycho_trans(object):
             if(self.update_coh_flag):
                 self.cal_coh_error(it)
 
-            if it == np.floor(self.start_ave*self.n_iterations):
-                if self.mode_flag:
-                    self.obj_mode_ave = self.obj_mode.copy()
-                    self.prb_mode_ave = self.prb_mode.copy()
-                elif self.multislice_flag:
-                    self.obj_ms_ave = self.obj_ms.copy()
-                    for ii in range(self.num_points):
-                        for jj in range(self.slice_num):
-                            self.prb_ms_ave[ii][jj] = self.prb_ms[ii][jj].copy()
-                else:
-                    self.obj_ave = self.obj.copy()
-                    self.prb_ave = self.prb.copy()
-                self.ave_i = 1.
+            if self.rank == 0 :
 
-            if it > np.floor(self.start_ave*self.n_iterations):
-                if self.mode_flag:
-                    self.obj_mode_ave = self.obj_mode_ave + self.obj_mode
-                    self.prb_mode_ave = self.prb_mode_ave + self.prb_mode
-                elif self.multislice_flag:
-                    self.obj_ms_ave = self.obj_ms_ave + self.obj_ms
-                    for ii in range(self.num_points):
-                        for jj in range(self.slice_num):
-                            self.prb_ms_ave[ii][jj] = self.prb_ms_ave[ii][jj] + self.prb_ms[ii][jj]
-                else:
-                    self.obj_ave = self.obj_ave + self.obj
-                    self.prb_ave = self.prb_ave + self.prb
-                self.ave_i = self.ave_i + 1
-
-            if self.mode_flag:
-                print(it, 'object_chi=', self.error_obj_mode[it, :self.obj_mode_num], 'probe_chi=', self.error_prb_mode[it, :self.prb_mode_num], 'diff_chi=', self.error_chi[it])
-            elif self.multislice_flag:
-                print(it, 'object_chi=', self.error_obj_ms[it, :self.slice_num], 'probe_chi=', self.error_prb_ms[it], 'diff_chi=', self.error_chi[it])
-            elif self.update_coh_flag:
-                print(it, 'object_chi=', self.error_obj[it], 'probe_chi=', self.error_prb[it], 'diff_chi=', self.error_chi[it], 'coh_chi=', self.error_coh[it])
-            else:
-                print(it, 'object_chi=', self.error_obj[it], 'probe_chi=', self.error_prb[it], 'diff_chi=', self.error_chi[it])
-
-            if self.save_tmp_pic_flag:
-                if np.mod(it, 5) == 0:
-                    save_tmp_pic_dir = './tmp_pic/'
-                    if not os.path.exists(save_tmp_pic_dir):
-                        os.makedirs(save_tmp_pic_dir)
-
-                    if self.prb_mode_num >= 4:
-                        nn_prb = 4
-                    else:
-                        nn_prb = self.prb_mode_num
-
-                    if self.obj_mode_num >= 4:
-                        nn_obj = 4
-                    else:
-                        nn_obj = self.obj_mode_num
-
-                    plt.figure()
-                    for ii in range(nn_prb):
-                        plt.subplot(2, 2, ii+1)
-                        plt.imshow(np.flipud(np.abs(self.prb_mode[:,:, ii].T)))
-                        plt.subplot(2, 2, ii+6)
-                        plt.imshow(np.flipud(np.abs(self.obj_mode[:,:, ii].T)))
-
-                    plt.savefig(save_tmp_pic_dir+'recon_'+self.scan_num+'_'+self.sign+'_'+np.str(it)+'.png')
-
-            if self.update_product_flag:
-                if (it >= self.start_update_product):
-                    if np.mod(it, 5) == 0:
-                        self.init_product()
-
-            t0 = time.time() 
-            self.elaps[5]+=t0-t1
-
-
-            if self.online_flag:
-                if it >= 0 and (it % 2) == 0:
+                if it == np.floor(self.start_ave*self.n_iterations):
                     if self.mode_flag:
-                        obj_tmp = self.obj_mode[:,:,0]
-                        prb_tmp = self.prb_mode[:,:,0]
-                        obj_amp_max = self.amp_max
-                        obj_amp_min = self.amp_min
-                        obj_pha_max = self.pha_max
-                        obj_pha_min = self.pha_min
+                        self.obj_mode_ave = self.obj_mode.copy()
+                        self.prb_mode_ave = self.prb_mode.copy()
                     elif self.multislice_flag:
-                        obj_tmp = self.obj_ms[:,:,self.slice_num-1]
-                        obj_tmp_2 = self.obj_ms[:,:,0]
-                        prb_tmp = self.prb_ms[0][0]
-                        obj_amp_max = self.amp_max[self.slice_num-1]
-                        obj_amp_min = self.amp_min[self.slice_num-1]
-                        obj_pha_max = self.pha_max[self.slice_num-1]
-                        obj_pha_min = self.pha_min[self.slice_num-1]
-                        obj_amp_max_2 = self.amp_max[0]
-                        obj_amp_min_2 = self.amp_min[0]
-                        obj_pha_max_2 = self.pha_max[0]
-                        obj_pha_min_2 = self.pha_min[0]
+                        self.obj_ms_ave = self.obj_ms.copy()
+                        for ii in range(self.num_points):
+                            for jj in range(self.slice_num):
+                                self.prb_ms_ave[ii][jj] = self.prb_ms[ii][jj].copy()
                     else:
-                        obj_tmp = self.obj
-                        prb_tmp = self.prb
-                        obj_amp_max = self.amp_max
-                        obj_amp_min = self.amp_min
-                        obj_pha_max = self.pha_max
-                        obj_pha_min = self.pha_min
-                    plt.figure(0)
-                    plt.ion()
-                    plt.clf()
-                    plt.subplot(331)
-                    plt.plot(self.points[0,:self.num_points],self.points[1,:self.num_points],'go')
-                    plt.xlim([np.min(self.points[0,:])-10,np.max(self.points[0,:])+10])
-                    plt.ylim([np.min(self.points[1,:])-10,np.max(self.points[1,:])+10])
-                    plt.gca().set_aspect('equal', adjustable='box')
-                    plt.axis('off')
-                    plt.title('scan path')
-                    plt.subplot(334)
-                    plt.imshow(np.fft.fftshift(np.log10(np.flipud(self.diff_array[self.num_points-1].T)+0.001)))
-                    plt.title('latest pattern')
-                    plt.axis('off')
-                    plt.subplot(332)
-                    plt.imshow(np.flipud(np.abs(prb_tmp.T)))
-                    plt.title('prb amp')
-                    plt.axis('off')
-                    plt.subplot(335)
-                    plt.imshow(np.flipud(np.angle(prb_tmp.T)))
-                    plt.title('prb pha')
-                    plt.axis('off')
-                    plt.subplot(333)
-                    plt.imshow(np.flipud(np.abs(obj_tmp[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
-                            interpolation='none',cmap='bone',clim=[obj_amp_min,obj_amp_max])
-                    plt.title('obj amp')
-                    plt.axis('off')
-                    plt.subplot(336)
-                    plt.imshow(np.flipud(np.angle(obj_tmp[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
-                            interpolation='none',cmap='bone',clim=[obj_pha_min,obj_pha_max])
-                    plt.title('obj pha')
-                    plt.axis('off')
-                    plt.subplot(337)
-                    plt.plot(self.error_chi[:it])
-                    plt.xlim([0,self.n_iterations])
-                    plt.title('diff err')
-                    if self.multislice_flag:
-                        plt.subplot(339)
-                        plt.imshow(np.flipud(np.angle(obj_tmp_2[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
-                                interpolation='none',cmap='bone',clim=[obj_pha_min_2,obj_pha_max_2])
-                        plt.title('obj pha 2')
-                        plt.axis('off')
-                    #plt.subplot(338)
-                    #plt.plot(self.error_prb[:it])
-                    #plt.xlim([0,self.n_iterations])
-                    #plt.title('prb err')
-                    #plt.subplot(339)
-                    #plt.plot(self.error_obj[:it])
-                    #plt.xlim([0,self.n_iterations])
-                    #plt.title('obj err')
-                    plt.draw()
-                    plt.show(block=False)
-                    plt.pause(0.1)
-                    #plt.show()
-                    if self.pc_flag:
-                        plt.figure(1)
+                        self.obj_ave = self.obj.copy()
+                        self.prb_ave = self.prb.copy()
+                    self.ave_i = 1.
+
+                if it > np.floor(self.start_ave*self.n_iterations):
+                    if self.mode_flag:
+                        self.obj_mode_ave = self.obj_mode_ave + self.obj_mode
+                        self.prb_mode_ave = self.prb_mode_ave + self.prb_mode
+                    elif self.multislice_flag:
+                        self.obj_ms_ave = self.obj_ms_ave + self.obj_ms
+                        for ii in range(self.num_points):
+                            for jj in range(self.slice_num):
+                                self.prb_ms_ave[ii][jj] = self.prb_ms_ave[ii][jj] + self.prb_ms[ii][jj]
+                    else:
+                        self.obj_ave = self.obj_ave + self.obj
+                        self.prb_ave = self.prb_ave + self.prb
+                    self.ave_i = self.ave_i + 1
+
+                if self.mode_flag:
+                    print(it, 'object_chi=', self.error_obj_mode[it, :self.obj_mode_num], 'probe_chi=', self.error_prb_mode[it, :self.prb_mode_num], 'diff_chi=', self.error_chi[it])
+                elif self.multislice_flag:
+                    print(it, 'object_chi=', self.error_obj_ms[it, :self.slice_num], 'probe_chi=', self.error_prb_ms[it], 'diff_chi=', self.error_chi[it])
+                elif self.update_coh_flag:
+                    print(it, 'object_chi=', self.error_obj[it], 'probe_chi=', self.error_prb[it], 'diff_chi=', self.error_chi[it], 'coh_chi=', self.error_coh[it])
+                else:
+                    print(it, 'object_chi=', self.error_obj[it], 'probe_chi=', self.error_prb[it], 'diff_chi=', self.error_chi[it])
+
+                if self.save_tmp_pic_flag:
+                    if np.mod(it, 5) == 0:
+                        save_tmp_pic_dir = './tmp_pic/'
+                        if not os.path.exists(save_tmp_pic_dir):
+                            os.makedirs(save_tmp_pic_dir)
+
+                        if self.prb_mode_num >= 4:
+                            nn_prb = 4
+                        else:
+                            nn_prb = self.prb_mode_num
+
+                        if self.obj_mode_num >= 4:
+                            nn_obj = 4
+                        else:
+                            nn_obj = self.obj_mode_num
+
+                        plt.figure()
+                        for ii in range(nn_prb):
+                            plt.subplot(2, 2, ii+1)
+                            plt.imshow(np.flipud(np.abs(self.prb_mode[:,:, ii].T)))
+                            plt.subplot(2, 2, ii+6)
+                            plt.imshow(np.flipud(np.abs(self.obj_mode[:,:, ii].T)))
+
+                        plt.savefig(save_tmp_pic_dir+'recon_'+self.scan_num+'_'+self.sign+'_'+np.str(it)+'.png')
+
+                if self.update_product_flag:
+                    if (it >= self.start_update_product):
+                        if np.mod(it, 5) == 0:
+                            self.init_product()
+
+                t0 = time.time() 
+                self.elaps[5]+=t0-t1
+
+
+                if self.online_flag:
+                    if it >= 0 and (it % 2) == 0:
+                        if self.mode_flag:
+                            obj_tmp = self.obj_mode[:,:,0]
+                            prb_tmp = self.prb_mode[:,:,0]
+                            obj_amp_max = self.amp_max
+                            obj_amp_min = self.amp_min
+                            obj_pha_max = self.pha_max
+                            obj_pha_min = self.pha_min
+                        elif self.multislice_flag:
+                            obj_tmp = self.obj_ms[:,:,self.slice_num-1]
+                            obj_tmp_2 = self.obj_ms[:,:,0]
+                            prb_tmp = self.prb_ms[0][0]
+                            obj_amp_max = self.amp_max[self.slice_num-1]
+                            obj_amp_min = self.amp_min[self.slice_num-1]
+                            obj_pha_max = self.pha_max[self.slice_num-1]
+                            obj_pha_min = self.pha_min[self.slice_num-1]
+                            obj_amp_max_2 = self.amp_max[0]
+                            obj_amp_min_2 = self.amp_min[0]
+                            obj_pha_max_2 = self.pha_max[0]
+                            obj_pha_min_2 = self.pha_min[0]
+                        else:
+                            obj_tmp = self.obj
+                            prb_tmp = self.prb
+                            obj_amp_max = self.amp_max
+                            obj_amp_min = self.amp_min
+                            obj_pha_max = self.pha_max
+                            obj_pha_min = self.pha_min
+                        plt.figure(0)
+                        plt.ion()
                         plt.clf()
-                        plt.subplot(121)
-                        plt.imshow(self.coh.T,interpolation='none')
-                        plt.title('psf')
-                        #coh_t = np.zeros((self.nx_prb/2,self.ny_prb/2))
-                        #coh_t[self.nx_prb/4-self.pc_kernel_n/2:self.nx_prb/4+self.pc_kernel_n/2,\
-                        #      self.ny_prb/4-self.pc_kernel_n/2:self.ny_prb/4+self.pc_kernel_n/2] = self.coh
-                        #coh_fft = np.abs(np.fft.fftshift(np.fft.ifftn(np.fft.fftshift(coh_t))))
-                        coh_fft = np.abs(np.fft.fftshift(np.fft.ifftn(np.fft.fftshift(self.coh))))
-                        plt.subplot(122)
-                        plt.imshow(coh_fft.T,interpolation='none')
-                        plt.title('coh')
+                        plt.subplot(331)
+                        plt.plot(self.points[0,:self.num_points],self.points[1,:self.num_points],'go')
+                        plt.xlim([np.min(self.points[0,:])-10,np.max(self.points[0,:])+10])
+                        plt.ylim([np.min(self.points[1,:])-10,np.max(self.points[1,:])+10])
+                        plt.gca().set_aspect('equal', adjustable='box')
+                        plt.axis('off')
+                        plt.title('scan path')
+                        plt.subplot(334)
+                        plt.imshow(np.fft.fftshift(np.log10(np.flipud(self.diff_array[self.num_points-1].T)+0.001)))
+                        plt.title('latest pattern')
+                        plt.axis('off')
+                        plt.subplot(332)
+                        plt.imshow(np.flipud(np.abs(prb_tmp.T)))
+                        plt.title('prb amp')
+                        plt.axis('off')
+                        plt.subplot(335)
+                        plt.imshow(np.flipud(np.angle(prb_tmp.T)))
+                        plt.title('prb pha')
+                        plt.axis('off')
+                        plt.subplot(333)
+                        plt.imshow(np.flipud(np.abs(obj_tmp[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
+                                interpolation='none',cmap='bone',clim=[obj_amp_min,obj_amp_max])
+                        plt.title('obj amp')
+                        plt.axis('off')
+                        plt.subplot(336)
+                        plt.imshow(np.flipud(np.angle(obj_tmp[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
+                                interpolation='none',cmap='bone',clim=[obj_pha_min,obj_pha_max])
+                        plt.title('obj pha')
+                        plt.axis('off')
+                        plt.subplot(337)
+                        plt.plot(self.error_chi[:it])
+                        plt.xlim([0,self.n_iterations])
+                        plt.title('diff err')
+                        if self.multislice_flag:
+                            plt.subplot(339)
+                            plt.imshow(np.flipud(np.angle(obj_tmp_2[self.obj_pad//2:-self.obj_pad//2,self.obj_pad//2:-self.obj_pad//2].T)),\
+                                    interpolation='none',cmap='bone',clim=[obj_pha_min_2,obj_pha_max_2])
+                            plt.title('obj pha 2')
+                            plt.axis('off')
+                        #plt.subplot(338)
+                        #plt.plot(self.error_prb[:it])
+                        #plt.xlim([0,self.n_iterations])
+                        #plt.title('prb err')
+                        #plt.subplot(339)
+                        #plt.plot(self.error_obj[:it])
+                        #plt.xlim([0,self.n_iterations])
+                        #plt.title('obj err')
                         plt.draw()
                         plt.show(block=False)
-                        #plt.draw()
+                        plt.pause(0.1)
                         #plt.show()
+                        if self.pc_flag:
+                            plt.figure(1)
+                            plt.clf()
+                            plt.subplot(121)
+                            plt.imshow(self.coh.T,interpolation='none')
+                            plt.title('psf')
+                            #coh_t = np.zeros((self.nx_prb/2,self.ny_prb/2))
+                            #coh_t[self.nx_prb/4-self.pc_kernel_n/2:self.nx_prb/4+self.pc_kernel_n/2,\
+                            #      self.ny_prb/4-self.pc_kernel_n/2:self.ny_prb/4+self.pc_kernel_n/2] = self.coh
+                            #coh_fft = np.abs(np.fft.fftshift(np.fft.ifftn(np.fft.fftshift(coh_t))))
+                            coh_fft = np.abs(np.fft.fftshift(np.fft.ifftn(np.fft.fftshift(self.coh))))
+                            plt.subplot(122)
+                            plt.imshow(coh_fft.T,interpolation='none')
+                            plt.title('coh')
+                            plt.draw()
+                            plt.show(block=False)
+                            #plt.draw()
+                            #plt.show()
 
 
-            t1 = time.time() 
-            self.elaps[8] += t1-t0
+                t1 = time.time() 
+                self.elaps[8] += t1-t0
 
+
+        self.ctx.pop() 
 
         self.time_end = time.time()
-        print('++++++++++++++++++++++++++++++++++++++++++++++++++')
-        print('object size:', self.nx_obj, 'x', self.ny_obj)
-        print('probe size:', self.nx_prb, 'x', self.ny_prb)
-        print('total scan points:', self.num_points)
-        print(self.n_iterations, 'iterations take', self.time_end - self.time_start, 'sec')
-        print('++++++++++++++++++++++++++++++++++++++++++++++++++')
+        if self.rank == 0 :
+            print('++++++++++++++++++++++++++++++++++++++++++++++++++')
+            print('object size:', self.nx_obj, 'x', self.ny_obj)
+            print('probe size:', self.nx_prb, 'x', self.ny_prb)
+            print('total scan points:', self.num_points)
+            print(self.n_iterations, 'iterations take', self.time_end - self.time_start, 'sec')
+            print('++++++++++++++++++++++++++++++++++++++++++++++++++')
 
-        #print('time elaps : ', self.elaps) 
+            #print('time elaps : ', self.elaps) 
 
-        if self.mode_flag:
-            self.obj_mode_ave = self.obj_mode_ave / self.ave_i
-            self.prb_mode_ave = self.prb_mode_ave / self.ave_i
-        elif self.multislice_flag:
-            self.obj_ms_ave = self.obj_ms_ave / self.ave_i
-            for i in range(self.num_points):
-                for j in range(self.slice_num):
-                    self.prb_ms_ave[i][j] = self.prb_ms_ave[i][j] / self.ave_i
-        else:
-            self.prb_ave = self.prb_ave / self.ave_i
-            self.obj_ave = self.obj_ave / self.ave_i
+            if self.mode_flag:
+                self.obj_mode_ave = self.obj_mode_ave / self.ave_i
+                self.prb_mode_ave = self.prb_mode_ave / self.ave_i
+            elif self.multislice_flag:
+                self.obj_ms_ave = self.obj_ms_ave / self.ave_i
+                for i in range(self.num_points):
+                    for j in range(self.slice_num):
+                        self.prb_ms_ave[i][j] = self.prb_ms_ave[i][j] / self.ave_i
+            else:
+                self.prb_ave = self.prb_ave / self.ave_i
+                self.obj_ave = self.obj_ave / self.ave_i
