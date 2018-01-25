@@ -455,7 +455,7 @@ class ptycho_trans(object):
         unsigned int tid = threadIdx.x ;
         unsigned long idx=tid+blockDim.x*blockIdx.x ;
         unsigned long idx_diff = idx + offset * blockDim.x * nx ;
-        unsigned int i = blockIdx.x /nx ;
+        //unsigned int i = blockIdx.x /nx ;
         double scale =  double(nx*blockDim.x) ;
         double scale_sqrt = sqrt(scale) ;
         cuDoubleComplex  fft = cuCmul(fft_tmp[idx], make_cuDoubleComplex(1.0/scale_sqrt,0.0))  ;
