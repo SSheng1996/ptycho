@@ -49,6 +49,12 @@ def parallel_function(fcn_name, *args, **kwargs):
         print('Parallel execution of `%s` failed: (%s) %s' % (fcn_name, ex.__class__.__name__, ex))
         traceback.print_exc()
 
+def LargestPowerOf2(number) :
+    res = 1
+    while res <=  number :
+        res *= 2 
+    return res/2
+
 
 class ptycho_trans(object):
     def __init__(self, diffamp):
@@ -289,7 +295,8 @@ class ptycho_trans(object):
         # make plan for cufft
         self.plan_f = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.gpu_batch_size)
         # last flan have different number of points.
-        self.plan_last = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.last)
+        if self.last > 0 :
+            self.plan_last = cu_fft.Plan( np.shape(self.prb), np.complex128, np.complex128, self.last)
 
 
 
@@ -326,7 +333,7 @@ class ptycho_trans(object):
 
 
         extern "C" {
-        __global__ void chi_sum_block( cuDoubleComplex * prb_obj, double * diff, double* diff_sum_sq , double* buff, int scale, int offset  )
+        __global__ void chi_sum_block( cuDoubleComplex * prb_obj, double * diff, double* diff_sum_sq , double* buff, int scale, int offset, int B  )
         {
         extern  __shared__ double sdata[];
 
@@ -345,12 +352,14 @@ class ptycho_trans(object):
         if (norm > 0.0) sdata[tid] = chi/norm ;
         __syncthreads() ;
 
-        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
+        for (unsigned int s=B/2; s>1; s>>=1)
         {
             if (tid < s) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
+        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -365,8 +374,9 @@ class ptycho_trans(object):
             __syncthreads() ;
         sdata[tid] += sdata[tid + 1];
         }
+        */
 
-        if(tid ==0 ) buff[blockIdx.x]=sdata[0] ; 
+        if(tid ==0 ) buff[blockIdx.x]=sdata[0] + sdata[1] ; 
         //if(tid ==0 && blockIdx.x < 16) printf("buff[%d]=%f , %d \\n",blockIdx.x,sdata[0], point ) ;
 
         
@@ -438,7 +448,7 @@ class ptycho_trans(object):
 
 
         extern "C" {
-        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_d, double* dev_tmp , int  nx , double sigma1, int offset )
+        __global__ void dm_cal_dev(cuDoubleComplex *fft_tmp, double * amp_tmp, double *diff, double* dev_d, double* dev_tmp , int  nx , double sigma1, int offset, int B )
         {
         extern __shared__ double sdata[] ; 
         
@@ -461,12 +471,18 @@ class ptycho_trans(object):
         sdata[tid] = dev * dev ;
         __syncthreads();
 
-        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        // first sum  only  Dim-B threads sum
+        // B is largest 2^power which is < block size 
+        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
+
+        //now just reduce first B items of sdata  
+        for (unsigned int s=B/2; s>1; s>>=1)
         {
-            if (tid < s) {
+            if (tid < s ) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
+        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -480,6 +496,7 @@ class ptycho_trans(object):
         sdata[tid] += sdata[tid + 2];
             __syncthreads() ;
         }
+        */
 
         if ( tid == 0 ) 
         dev_tmp[blockIdx.x] = (sdata[0]+sdata[1])/scale ;
@@ -493,7 +510,7 @@ class ptycho_trans(object):
         }
 
         extern "C" {
-        __global__ void dm_reduce_dev(double* dev_tmp,  double * power   )
+        __global__ void dm_reduce_dev(double* dev_tmp,  double * power, int B   )
         {
         extern __shared__ double sdata[] ; 
 
@@ -503,12 +520,14 @@ class ptycho_trans(object):
         sdata[tid] = dev_tmp[idx];
         __syncthreads();
 
-        for (unsigned int s=blockDim.x/2; s>32; s>>=1)
+        if (tid < blockDim.x-B) {sdata[tid] += sdata[tid + B] ;}
+        for (unsigned int s=B/2; s>1; s>>=1)
         {
             if (tid < s) {
             sdata[tid] += sdata[tid + s];}
             __syncthreads();
         }
+        /*
         if (tid < 32)
         {
         sdata[tid] += sdata[tid + 32];
@@ -522,6 +541,7 @@ class ptycho_trans(object):
         sdata[tid] += sdata[tid + 2];
             __syncthreads() ;
         }
+        */
 
         if ( tid == 0 ) 
         power[blockIdx.x] =sdata[0] + sdata[1] ;
@@ -699,7 +719,6 @@ class ptycho_trans(object):
 
         self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
         self.kernel_chi_sum_block = func_mod.get_function("chi_sum_block") 
-        self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_chi_reduce = func_mod.get_function("chi_reduce") 
         self.kernel_dm_prb_obj = func_mod.get_function("dm_prb_obj") 
         self.kernel_dm_cal_dev = func_mod.get_function("dm_cal_dev") 
@@ -1181,22 +1200,24 @@ class ptycho_trans(object):
         block_size = self.ny_prb 
         n_blocks = size * self.nx_prb 
         sigma1 = np.float64(self.sigma1) 
+        B=np.int32(LargestPowerOf2(block_size))
         self.kernel_dm_cal_dev(self.fft_tmp_d, self.amp_tmp_d, self.diff_d, self.dev_d,  self.dev_buff_d, nx ,  \
-                sigma1, offset, \
+                sigma1, offset, B ,\
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.ny_prb* 8 ) 
 		
         # cpu calculate power or futher gpu reduce if points are a lot .
         block_size = self.nx_prb
         n_blocks = size
-        self.kernel_dm_reduce_dev(self.dev_buff_d, self.power_d ,
+        self.kernel_dm_reduce_dev(self.dev_buff_d, self.power_d , B, \
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) , shared = self.nx_prb* 8 ) 
         
         # calculate diff+dev*sqrt(sigma2/power) 
         block_size = self.ny_prb
         n_blocks = size*self.nx_prb
         sigma2=np.float64(self.sigma2)
-        self.kernel_dm_k4(self.diff_d, self.dev_d, self.power_d, self.amp_tmp_d , self.fft_tmp_d, sigma2, nx, offset, \
+        self.kernel_dm_k4(self.diff_d, self.dev_d, self.power_d, self.amp_tmp_d , self.fft_tmp_d, sigma2, nx, offset,  \
                 block=(block_size, 1,1 ) , grid = ( n_blocks, 1,1) )
+
 
         # inverse fft
         cu_fft.ifft(self.fft_tmp_d, self.fft_tmp_d, self.plan_f, True )
@@ -1220,6 +1241,7 @@ class ptycho_trans(object):
         n_batch = self.num_points//self.gpu_batch_size
         #print(n_batch, self.num_points, self.gpu_batch_size)
         for i in range(n_batch) :
+            ##print " batch number :" , i, "total points: ", self.num_points 
             self.dm_gpu_single( i * self.gpu_batch_size, self.gpu_batch_size)
 
         #lasr batch have different size :
@@ -2094,8 +2116,9 @@ class ptycho_trans(object):
         chi_tmp=np.zeros((nblocks,),dtype=np.float64) 
         buff =gpuarray.empty(np.shape(chi_tmp),dtype=np.float64)
         scale = np.int32(self.nx_prb*self.ny_prb )
+        B=np.int32(LargestPowerOf2(block_size))
         self.kernel_chi_sum_block(self.fft_tmp_d, self.diff_d, self.diff_sum_sq_d, buff, \
-                 scale, offset, block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
+                 scale, offset, B,  block=(block_size,1,1 ) , grid=(nblocks,1,1) , shared=block_size*8  )
         chi_tmp = buff.get() 
         return np.sum(chi_tmp) 
 
