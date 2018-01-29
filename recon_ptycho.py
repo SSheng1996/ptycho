@@ -240,8 +240,9 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
 
     recon.processes = 0
     recon.gpu_flag = gpu_flag
-    if rank == 0 :
-        recon.recon_ptycho()
+    recon.recon_ptycho()
+    #if rank == 0 :
+    #    recon.recon_ptycho()
     #if rank == 0 : 
         #recon.save_recon()
         #recon.display_recon()

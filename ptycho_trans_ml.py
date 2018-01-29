@@ -33,7 +33,8 @@ from pycuda import gpuarray, compiler, tools
 import skcuda.fft as cu_fft
 
 ### For MPI
-import mpi4py as MPI
+#import mpi4py 
+from mpi4py import  MPI
 
 
 if 'PROFILE' not in os.environ:
@@ -722,7 +723,7 @@ class ptycho_trans(object):
     
 
 
-        """, no_extern_c=1)
+        """, no_extern_c=1,keep=True)
 
 
         self.kernel_chi_prb_obj = func_mod.get_function("cal_prb_obj") 
@@ -1468,8 +1469,9 @@ class ptycho_trans(object):
         obj_update_l =self.obj_d.get()
         norm_probe_array_l =self.prb_norm_d.get()
         
-        object_update = self.comm.reduce(obj_update_l,op=MPI.SUM)
-        norm_probe_array = self.comm.reduce(norm_probe_array_l,op=MPI.SUM)
+        obj_update = self.comm.reduce(obj_update_l )
+        norm_probe_array = self.comm.reduce(norm_probe_array_l)
+        #print "shape of obj_update :", np.shape(obj_update) 
 
         cuda.Context.synchronize()
 
@@ -1652,8 +1654,8 @@ class ptycho_trans(object):
         prb_l=self.prb_upd_d.get() 
 
         ### Collect rsults from other MPI ranks and sum over 
-        norm = self.comm.reduce(norm_l , op=MPI.SUM ) 
-        prb = self.comm.reduce(prb_l , op=MPI.SUM )
+        norm = self.comm.reduce(norm_l  ) 
+        prb = self.comm.reduce(prb_l  )
 
         if self.rank == 0 :
             #update prb
@@ -2157,7 +2159,7 @@ class ptycho_trans(object):
         if  self.last > 0 :
             chi += self.chi_gpu_single( n_batch*self.gpu_batch_size, self.last ) 
 
-        chi_t = self.comm.reduce(chi, op=MPI.SUM) 
+        chi_t = self.comm.reduce(chi ) 
         self.error_chi[it] = np.sqrt(chi_t/self.num_points)
     
         
@@ -2527,6 +2529,8 @@ class ptycho_trans(object):
 
         self.prb = self.comm.bcast(self.prb , root = 0 ) 
         self.obj = self.comm.bcast(self.obj , root = 0 ) 
+        self.nx_obj = self.comm.bcast(self.nx_obj , root = 0 ) 
+        self.ny_obj = self.comm.bcast(self.ny_obj , root = 0 ) 
 
         if self.rank ==0 :
             product_a = np.array_split(np.array(self.product), self.size )
@@ -2534,7 +2538,7 @@ class ptycho_trans(object):
             for i in range ( 1, self.size) :
                 self.comm.Send(product_a[i], dest=i , tag=700+i ) 
         else :
-            self.product_l = np.empty(self.ptdist[i], dtype=np.complex128)
+            self.product_l = np.empty(self.ptdist[self.rank], dtype=np.complex128)
             self.comm.Recv(self.product_l, source =0 , tag= self.rank+700 )
 
         self.point_info = self.comm.bcast( self.point_info, root=0 ) 
