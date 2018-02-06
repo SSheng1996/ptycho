@@ -36,7 +36,7 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
     size = comm.Get_size()
     lrank=int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
     lsize=int(os.environ['OMPI_COMM_WORLD_LOCAL_SIZE'])
-    print 'my rank is: {} ,local rank is {},local_size {} , Total rank is : {}'.format( rank ,lrank, lsize, size )
+    print ("my rank ,local rank is local_size  Total rank  : ", rank ,lrank, lsize, size )
     
 
     mode_flag = 0
@@ -66,7 +66,7 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
        f.close()
 
        nz, nx , ny =np.shape(diffamp)
-       print "shape of diffamp: ", np.shape(diffamp)
+       print ("shape of diffamp: ", np.shape(diffamp) )
        
        diff_all=np.array_split(diffamp, size)
        list=[] 
@@ -94,8 +94,8 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
        diff_l = np.empty(list[rank], dtype=np.float64)
        comm.Recv(diff_l, source = 0, tag = rank+70 ) 
     nz_l, nx , ny =np.shape(diff_l)
-    print "shape of diff_l: ",rank, np.shape(diff_l)
-    print rank , x_range, y_range , dr_x, dr_y , z_m, lambda_nm,nz_l        
+    print ("shape of diff_l: ",rank, np.shape(diff_l) )
+    print (rank , x_range, y_range , dr_x, dr_y , z_m, lambda_nm,nz_l )        
 
 
 

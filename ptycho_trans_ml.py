@@ -283,7 +283,7 @@ class ptycho_trans(object):
         cuda.init()
         num = cuda.Device.count()
         if num < self.lsize  :
-           print "Not enough gpu"
+           print ("Not enough gpu" )
            self.comm.Abort()  
         self.gpu_number = self.lrank
         self.dev=cuda.Device(self.gpu_number)
@@ -2119,7 +2119,6 @@ class ptycho_trans(object):
                     self.init_obj()
 
             self.init_product()
-            print "after init_product"
 
             if self.pc_flag:
                 if self.init_coh_flag:
