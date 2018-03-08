@@ -924,23 +924,23 @@ class ptycho_trans(object):
         diff = self.diff_array[i]
 
         result = []
-        prod_mode = np.zeros((self.nx_prb, self.ny_prb, self.prb_mode_num, self.obj_mode_num)).astype(complex)
-        tmp_fft_mode = np.zeros((self.nx_prb, self.ny_prb, self.prb_mode_num, self.obj_mode_num)).astype(complex)
+        prod_mode = np.zeros((self.prb_mode_num, self.obj_mode_num, self.nx_prb, self.ny_prb )).astype(complex)
+        tmp_fft_mode = np.zeros((self.prb_mode_num, self.obj_mode_num, self.nx_prb, self.ny_prb)).astype(complex)
 
         tmp_fft_mode_total = np.zeros((self.nx_prb, self.ny_prb))
         for j in range(self.prb_mode_num):
             for k in range(self.obj_mode_num):
-                prod_mode[:,:, j, k] = self.prb_mode[:,:, j] * self.obj_mode[x_start:x_end, y_start:y_end, k]
-                tmp = 2. * prod_mode[:,:, j, k] - self.product[i][j][k]
+                prod_mode[j,k,:,:] = self.prb_mode[j,:,:] * self.obj_mode[k,x_start:x_end, y_start:y_end]
+                tmp = 2. * prod_mode[j,k,:,:] - self.product[i][j][k]
 
-                tmp_fft_mode[:,:, j, k] = fftn(tmp) / np.sqrt(np.size(tmp))
+                tmp_fft_mode[j,k,:,:] = fftn(tmp) / np.sqrt(np.size(tmp))
 
-                tmp_fft_mode_total += np.abs(tmp_fft_mode[:,:, j, k])**2
+                tmp_fft_mode_total += np.abs(tmp_fft_mode[j,k,:,:])**2
 
         for j in range(self.prb_mode_num):
             for k in range(self.obj_mode_num):
-                amp_tmp = np.abs(tmp_fft_mode[:,:, j, k])
-                ph_tmp = tmp_fft_mode[:,:, j, k] / (amp_tmp+self.sigma1)
+                amp_tmp = np.abs(tmp_fft_mode[j,k,:,:])
+                ph_tmp = tmp_fft_mode[j,k,:,:] / (amp_tmp+self.sigma1)
                 (index_x, index_y) = np.where(diff >= 0.)
                 dev = amp_tmp - diff * amp_tmp / (np.sqrt(tmp_fft_mode_total)+self.sigma1)
                 power = np.sum((dev[index_x, index_y])**2)/(self.nx_prb*self.ny_prb)
@@ -951,7 +951,7 @@ class ptycho_trans(object):
 
                 tmp2 = ifftn(amp_tmp*ph_tmp) *  np.sqrt(np.size(tmp))
 
-                result.append(self.beta*(tmp2 - prod_mode[:,:, j, k]))
+                result.append(self.beta*(tmp2 - prod_mode[j,k,:,:]))
 
         return result
 
@@ -990,8 +990,8 @@ class ptycho_trans(object):
             norm_probe_array = np.zeros((self.nx_obj, self.ny_obj)) + self.alpha
 
             for j in range(self.prb_mode_num):
-                prb_sqr = np.abs(self.prb_mode[:,:, j]) ** 2
-                prb_conj = self.prb_mode[:,:, j].conjugate()
+                prb_sqr = np.abs(self.prb_mode[j,:,:]) ** 2
+                prb_conj = self.prb_mode[j,:,:].conjugate()
                 for i, (x_start, x_end, y_start, y_end) in enumerate(self.point_info):
                     norm_probe_array[x_start:x_end, y_start:y_end] += prb_sqr
                     obj_update[x_start:x_end, y_start:y_end] += prb_conj * self.product[i][j][k]
@@ -1012,7 +1012,7 @@ class ptycho_trans(object):
             if(np.size(index_x) > 0):
                 obj_update[index_x, index_y] = np.abs(obj_update[index_x, index_y]) * np.exp(1.j*self.pha_min_mode[k])
 
-            self.obj_mode[:,:, k] = obj_update.copy()
+            self.obj_mode[k,:,:] = obj_update.copy()
 
     # update object
     def cal_object_trans(self):
@@ -1127,9 +1127,9 @@ class ptycho_trans(object):
     # keep probe well centered
     def check_probe_center(self):
         if self.mode_flag:
-            slice_tmp = self.prb_mode[:,:, 0].copy()
+            slice_tmp = self.prb_mode[0,:,:].copy()
             mass_center_x, mass_center_y = self.cal_mass_center(slice_tmp)
-            self.prb_mode[:,:, 0] = np.roll(np.roll(slice_tmp, self.nx_prb//2-mass_center_x, 0), self.ny_prb//2-mass_center_y, 1)
+            self.prb_mode[0,:,:] = np.roll(np.roll(slice_tmp, self.nx_prb//2-mass_center_x, 0), self.ny_prb//2-mass_center_y, 1)
             # for j in range(self.prb_mode_num):
             #    slice_tmp = self.prb_mode[:,:,j].copy()
             #    index_tmp = np.where(np.abs(slice_tmp) == np.max(np.abs(slice_tmp)))
@@ -1148,17 +1148,17 @@ class ptycho_trans(object):
     def cal_probe_trans_mode(self):
         weight = 0.1
         for j in range(self.prb_mode_num):
-            probe_update = weight * self.num_points * self.prb_mode[:,:, j]
+            probe_update = weight * self.num_points * self.prb_mode[j,:,:]
             norm_obj_array = np.zeros((self.nx_prb, self.ny_prb)) + weight * self.num_points
             for k in range(self.obj_mode_num):
-                obj_sqr = np.abs(self.obj_mode[:,:, k]) ** 2
-                obj_conj = np.conjugate(self.obj_mode[:,:, k])
+                obj_sqr = np.abs(self.obj_mode[k,:,:]) ** 2
+                obj_conj = np.conjugate(self.obj_mode[k,:,:])
                 for i, (x_start, x_end, y_start, y_end) in enumerate(self.point_info):
                     probe_update += self.product[i][j][k] * obj_conj[x_start:x_end, y_start:y_end]
                     norm_obj_array += obj_sqr[x_start:x_end, y_start:y_end]
 
             probe_update = probe_update / norm_obj_array
-            self.prb_mode[:,:, j] = probe_update.copy()
+            self.prb_mode[j,:,:] = probe_update.copy()
 
         if(self.prb_center_flag):
             self.check_probe_center()
@@ -1528,9 +1528,9 @@ class ptycho_trans(object):
 
     def init_obj(self):
         if self.mode_flag:
-            self.obj_mode = np.zeros((self.nx_obj, self.ny_obj, self.obj_mode_num)).astype(complex)
+            self.obj_mode = np.zeros((self.obj_mode_num, self.nx_obj, self.ny_obj)).astype(complex)
             for i in range(self.obj_mode_num):
-                self.obj_mode[:,:, i] = np.random.uniform(0, 0.5, (self.nx_obj, self.ny_obj)) * \
+                self.obj_mode[i,:,:] = np.random.uniform(0, 0.5, (self.nx_obj, self.ny_obj)) * \
                     np.exp(np.random.uniform(0, 0.5, (self.nx_obj, self.ny_obj))*1.j)
         elif self.multislice_flag:
             self.obj_ms = np.zeros((self.nx_obj, self.ny_obj, self.slice_num)).astype(complex)
@@ -1576,11 +1576,11 @@ class ptycho_trans(object):
     def init_prb(self):
         print('initialize probe')
         if self.mode_flag:
-            self.prb_mode = np.zeros((self.nx_prb, self.ny_prb, self.prb_mode_num)).astype(complex)
+            self.prb_mode = np.zeros((self.prb_mode_num, self.nx_prb, self.ny_prb)).astype(complex)
             for i in range(self.prb_mode_num):
-                self.prb_mode[:,:, i] = np.random.uniform(0, 0.5, (self.nx_prb, self.ny_prb)) * \
+                self.prb_mode[i,:,:] = np.random.uniform(0, 0.5, (self.nx_prb, self.ny_prb)) * \
                     np.exp(np.random.uniform(0, 0.5, (self.nx_prb, self.ny_prb))*1.j)
-                self.prb_mode[self.nx_prb//2-10:self.nx_prb//2+10, self.ny_prb//2-10:self.ny_prb//2+10, i] = 1.
+                self.prb_mode[i,self.nx_prb//2-10:self.nx_prb//2+10, self.ny_prb//2-10:self.ny_prb//2+10] = 1.
         elif self.multislice_flag:
             #dummy = self.dist_n(self.nx_prb)
             #index = np.where(dummy <= 35.)
@@ -1628,7 +1628,7 @@ class ptycho_trans(object):
                 for j in range(self.prb_mode_num):
                     self.product[i][j] = [0 for ii in range(self.obj_mode_num)]
                     for k in range(self.obj_mode_num):
-                        self.product[i][j][k] = self.prb_mode[:,:, j] * self.obj_mode[x_start:x_end, y_start:y_end, k]
+                        self.product[i][j][k] = self.prb_mode[j,:,:] * self.obj_mode[k,x_start:x_end, y_start:y_end]
         elif self.multislice_flag:
             self.amp_max_ms = self.amp_max
             self.amp_min_ms = self.amp_min
@@ -1672,8 +1672,8 @@ class ptycho_trans(object):
     def cal_obj_error(self, it):
         if self.mode_flag:
             for j in range(self.obj_mode_num):
-                self.error_obj_mode[it, j] = np.sqrt(np.sum(np.abs(self.obj_mode[:,:, j] - self.obj_mode_old[:,:, j])**2)) / \
-                    np.sqrt(np.sum(np.abs(self.obj_mode[:,:, j])**2))
+                self.error_obj_mode[it, j] = np.sqrt(np.sum(np.abs(self.obj_mode[j,:,:] - self.obj_mode_old[j,:,:])**2)) / \
+                    np.sqrt(np.sum(np.abs(self.obj_mode[j,:,:])**2))
         elif self.multislice_flag:
             for j in range(self.slice_num):
                 self.error_obj_ms[it, j] = np.sqrt(np.sum(np.abs(self.obj_ms[:,:, j] - self.obj_ms_old[:,:, j])**2)) / \
@@ -1685,7 +1685,7 @@ class ptycho_trans(object):
     def cal_prb_error(self, it):
         if self.mode_flag:
             for j in range(self.prb_mode_num):
-                self.error_prb_mode[it, j] = np.sqrt(np.sum(np.abs(self.prb_mode[:,:, j] - self.prb_mode_old[:,:, j])**2)) / \
+                self.error_prb_mode[it, j] = np.sqrt(np.sum(np.abs(self.prb_mode[j,:,:] - self.prb_mode_old[j,:,:])**2)) / \
                     np.sqrt(np.sum(np.abs(self.prb_mode[:,:, j])**2))
         elif self.multislice_flag:
             '''
@@ -1709,7 +1709,7 @@ class ptycho_trans(object):
                 tmp = np.zeros((self.nx_prb, self.ny_prb))
                 for j in range(self.prb_mode_num):
                     for k in range(self.obj_mode_num):
-                        tmp = tmp + (np.abs(fftn(self.prb_mode[:,:, j]*self.obj_mode[x_start:x_end, y_start:y_end, k])/np.sqrt(1.*self.nx_prb*self.ny_prb)))**2
+                        tmp = tmp + (np.abs(fftn(self.prb_mode[j,:,:]*self.obj_mode[k, x_start:x_end, y_start:y_end])/np.sqrt(1.*self.nx_prb*self.ny_prb)))**2
                 if np.sum((self.diff_array[i])**2) > 0.:
                     chi_tmp = chi_tmp + np.sum((np.sqrt(tmp) - self.diff_array[i])**2)/(np.sum((self.diff_array[i])**2))
         elif self.multislice_flag:
@@ -2505,7 +2505,8 @@ class ptycho_trans(object):
                 self.elaps[8] += t1-t0
 
 
-        self.ctx.pop() 
+        if  self.gpu_flag :
+            self.ctx.pop() 
 
         self.time_end = time.time()
         if self.rank == 0 :

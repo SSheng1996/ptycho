@@ -13,6 +13,14 @@ import simulate_zp as szp
 import h5py
 from mpi4py import MPI
 
+def shift_sum(array_in,x_range):
+    x_shift = np.arange(x_range+1) - x_range/2
+    array_out = np.zeros_like(array_in)
+    for i in range(x_range+1):
+        array_out += np.roll(array_in,np.int(x_shift[i]),0)
+    return array_out
+
+
 def congrid_fft(array_in, shape):
     x_in, y_in = np.shape(array_in)
     array_in_fft = np.fft.fftshift(np.fft.fftn(np.fft.fftshift(array_in)))/np.sqrt(1.*x_in*y_in)
@@ -39,7 +47,7 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
     print ("my rank ,local rank is local_size  Total rank  : ", rank ,lrank, lsize, size )
     
 
-    mode_flag = 0
+    mode_flag = 1
     mesh_flag = 1
     distance = 0
     x_range=np.int64(0)
@@ -224,12 +232,12 @@ def recon(scan_num,sign,n_iterations,p_flag, gpu_flag):
             recon.prb = prb
         else:
             recon.start_update_probe = 0
-            recon.prb_mode =  np.zeros((recon.nx_prb, recon.ny_prb, recon.prb_mode_num)).astype(complex)
-            recon.prb_mode[:,:,0] = prb
-            recon.prb_mode[:,:,1] = shift_sum(prb,20) / 40.
-            recon.prb_mode[:,:,2] = shift_sum(prb,16) / 32.
-            recon.prb_mode[:,:,3] = shift_sum(prb,10) / 20.
-            recon.prb_mode[:,:,4] = shift_sum(prb,6) / 12.
+            recon.prb_mode =  np.zeros((recon.prb_mode_num,recon.nx_prb, recon.ny_prb)).astype(complex)
+            recon.prb_mode[0,:,:] = prb
+            recon.prb_mode[1,:,:] = shift_sum(prb,20) / 40.
+            recon.prb_mode[2,:,:] = shift_sum(prb,16) / 32.
+            recon.prb_mode[3,:,:] = shift_sum(prb,10) / 20.
+            recon.prb_mode[4,:,:] = shift_sum(prb,6) / 12.
 
     recon.sf_flag = False
 
